@@ -1,0 +1,26 @@
+dataset:
+  class_name: WMDP
+  name: wmdp
+  # forget domains encoded in split: bio / cyber / chem (underscore-separated)
+  split: bio_cyber
+  max_len: 512
+  # Local JSONL exported by `scripts/cache_mmlu.py`
+  mmlu_retain_file: eval-method/wmdp/data/mmlu/all_auxiliary_train.jsonl
+  # Optional: comma-separated subject filter for MMLU retain prompts.
+  # NOTE: the repo's `all_auxiliary_train.jsonl` has empty `subject` fields, so this filter only
+  # takes effect if you use a subjectful split (e.g. `all_validation.jsonl` or `all_test.jsonl`).
+  mmlu_retain_subjects: null
+  # Optional caps for faster iteration
+  max_forget: null
+
+conv_template:
+  # We store the *full* MCQ prompt (ending with "Answer:") in `question`,
+  # and the correct choice letter ("A"/"B"/"C"/"D") in `answer`.
+  question_start_token: ""
+  question_end_token: ""
+  # Add a single trailing space so the next-token distribution corresponds to the choice letter.
+  answer_token: " "
+  # IMPORTANT: preserve the trailing space in `answer_token` (do NOT strip final prompt).
+  # Keep ToFU behavior unchanged (other datasets default to strip).
+  strip_prompt: false
+  max_len: 512

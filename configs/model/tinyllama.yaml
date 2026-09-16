@@ -1,0 +1,4 @@
+model_name: tinyllama
+model_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+tokenizer_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+attn_implementation: eager  # align with CBD-CKPT for fair comparison

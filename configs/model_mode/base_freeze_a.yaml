@@ -1,0 +1,9 @@
+mode: base
+freeze_lora_a: true
+Lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+  bias: none
+  task_type: CAUSAL_LM
+  target_modules: ["up_proj"]

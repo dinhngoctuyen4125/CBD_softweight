@@ -1,0 +1,4 @@
+forget_loss: GradDescentLossFunc
+retain_loss: UniformLossFunc
+retain_weight: 1.0
+forget_weight: 1.0
