@@ -1,131 +1,133 @@
-# CBD
+# CBD-DFB — Discriminative Subspace Unlearning for DeepSeek
 
-Code release for reproducing the CBD experiments. The repository provides the source code, configuration files, and a unified reproduction entry point. Datasets and model weights are configured through local paths so the same entry point can be used across machines.
+Pipeline học unlearning trên dữ liệu DeepSeek deprecated API, sử dụng phương pháp CBD-DFB (gradient projection lên discriminative subspace).
 
-## Installation
-
-Create the Python environment from the provided environment file or install the package requirements manually.
+## Cài Đặt
 
 ```bash
 conda env create -f environment.yaml
 conda activate cbd
 ```
 
-or
+## Dữ Liệu
 
-```bash
-pip install -r requirements.txt
+```
+data/deepseek/
+├── D_forget.json          # 9667 mẫu (train + valid, 80/20)
+│                          #   "probing input" → prompt
+│                          #   "y_neg" → deprecated API (forget)
+│                          #   "y_pos" → updated API (retain)
+├── D_test_U_dep.json      # 581 mẫu test — kỳ vọng score CAO (deprecated)
+└── D_test_U_nondep.json   # 17179 mẫu test — kỳ vọng score THẤP (bình thường)
 ```
 
-## External Resources
+## Chạy Pipeline
 
-Datasets and models are expected to live outside the repository. Point the code to local copies through environment variables when needed.
-
-Common variables:
+Chạy toàn bộ 3 giai đoạn:
 
 ```bash
-export CBD_DATA_ROOT=/path/to/data/root
-export PYTHON=/path/to/python
-export REPRO_CONDA_ENV=cbd
-export ASSIST_MODEL=/path/to/TinyLlama-1.1B-Chat-v1.0
-export TOFU_BASE_MODEL=/path/to/tofu_ft_llama2-7b
-export BASE_MODEL=/path/to/zephyr-7b-beta
+bash run_cbd.sh
 ```
 
-The code defaults to offline Hugging Face behavior. Set these variables if online loading is desired:
+Hoặc chạy từng giai đoạn:
 
 ```bash
-export HF_HUB_OFFLINE=0
-export TRANSFORMERS_OFFLINE=0
-export HF_DATASETS_OFFLINE=0
+bash run_cbd.sh basis    # ① Trích xuất discriminative subspace
+bash run_cbd.sh train    # ② Train LoRA + gradient projection
+bash run_cbd.sh infer    # ③ Infer + thống kê score
 ```
 
-Generated checkpoints, logs, bases, and evaluation outputs are written under `artifacts/`, which is intentionally ignored by git.
+### Giai đoạn ① — Trích xuất CBD-DFB Basis
 
-## Unified Entry Point
-
-All public training, evaluation, and sweep commands go through:
+Tạo LoRA trên TinyLlama, thu gradient per-sample trên forget/retain, giải bài toán trị riêng tổng quát → tìm top-k discriminative subspace.
 
 ```bash
-python scripts/hf_forget_train.py repro --help
+python scripts/extract_cbd_dfb_basis.py \
+    --data_path data/deepseek/D_forget.json \
+    --max_forget 7733 --max_retain 7733 \
+    --top_k 192 --batch_size 4 --max_len 512 \
+    --output_dir artifacts/basis_cbd_dfb/deepseek_seed42
 ```
 
-The entry point covers:
+**Output:** `artifacts/basis_cbd_dfb/deepseek_seed42/cbd_dfb_basis_deepseek_forget_vs_deepseek_retain.pkl`
 
-- Datasets: `ToFU01`, `ToFU05`, `ToFU10`, and `WMDP`
-- White-box methods: `ga`, `ga+gd`, `ga+kl`, `dpo`, `dpo+gd`, `dpo+kl`, `npo`, `npo+gd`, `npo+kl`
-- Gray-box methods: `uld`, `offset`
-- Black-box method: `CBD-DFB`
-- Gray-box baseline: `GPM`
-- Sweeps: `top_k`, basis retain size, basis forget size, LoRA rank, and forgetting steps
+### Giai đoạn ② — Train Unlearn Model
 
-Use `--dry-run` to print the command that would be executed without starting training.
-
-## Paper Table Reproduction
-
-The table-level route expands paper tables into the fixed commands used by this repository:
+Dùng Hydra config để train LoRA với CBDDFBForgetTrainer — mỗi bước backward, gradient được project lên subspace Q: `g ← QQ^T g`.
 
 ```bash
-python scripts/hf_forget_train.py repro table all --dry-run
-python scripts/hf_forget_train.py repro table A4 --gpus 0,1,2,3
-python scripts/hf_forget_train.py repro table B6 wmdp npo+gd --values 125 --stage train --gpus 0,1,2,3
-python scripts/hf_forget_train.py repro table B1 tofu10 --stage both --gpus 0
+python scripts/hf_forget_train.py \
+    --config-name cbd_dfb_deepseek \
+    enable_cbd_dfb=true \
+    cbd_dfb_basis_path=artifacts/basis_cbd_dfb/deepseek_seed42/cbd_dfb_basis_deepseek_forget_vs_deepseek_retain.pkl \
+    seed=42
 ```
 
-Supported table ids are `A1`, `A2`, `A3`, `A4`, `B1`, `B2`, `B3`, `B4`, `B5`, `B6`, and `all`.
-You can filter table commands by dataset or method, for example `wmdp`, `tofu10`, `npo+gd`, or `uld`.
-For sweep tables, `--values` can restrict the sweep values; for B6 it restricts the forgetting steps.
+**Output:** LoRA checkpoint trong `artifacts/outputs_trained_models/cbd_dfb_deepseek/`
 
-`--stage train` runs only training/setup, `--stage eval` evaluates an existing run, and `--stage both` runs the full command.
-Generated checkpoints and evaluation outputs stay under ignored artifact directories.
+### Giai đoạn ③ — Infer + Thống kê
 
-## Examples
-
-White-box ToFU:
+Tính `score = CE_finetuned - CE_original` trên valid set → tìm threshold, sau đó test trên 2 tập test.
 
 ```bash
-python scripts/hf_forget_train.py repro whitebox tofu dpo forget10 42 --gpus 0,1,2,3
+python scripts/infer_deepseek.py \
+    --original_model_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --finetuned_model_path artifacts/outputs_trained_models/cbd_dfb_deepseek/<checkpoint> \
+    --valid_data_path data/deepseek/D_forget.json \
+    --test_dep_path data/deepseek/D_test_U_dep.json \
+    --test_nondep_path data/deepseek/D_test_U_nondep.json \
+    --output_dir artifacts/eval_outputs/deepseek
 ```
 
-Gray-box WMDP:
+**Output:** Bảng thống kê score + histogram
 
-```bash
-python scripts/hf_forget_train.py repro graybox wmdp uld 42 --split bio_cyber_chem --gpus 0,1,2,3
+## Cấu Trúc Dự Án
+
+```
+CBD_softweight/
+├── run_cbd.sh                         # 🚀 Script chạy pipeline
+├── environment.yaml                   # Conda environment
+│
+├── configs/                           # ⚙️ Hydra configs (dùng bởi giai đoạn ②)
+│   ├── cbd_dfb_deepseek.yaml          #   Config chính, merge 5 sub-configs
+│   ├── data/deepseek.yaml             #   Dataset class, path, conv_template
+│   ├── data_mode/forget_retain.yaml   #   with_retain, retain_num
+│   ├── model/tinyllama.yaml           #   Model path, tokenizer path
+│   ├── model_mode/base_freeze_a.yaml  #   LoRA rank, alpha, target modules
+│   └── unlearn_loss/gd+kl.yaml       #   Loss = GradDescent(forget) + KL(retain)
+│
+├── scripts/                           # 🔧 Scripts chạy trực tiếp
+│   ├── extract_cbd_dfb_basis.py       #   Giai đoạn ①: trích xuất basis
+│   ├── hf_forget_train.py             #   Giai đoạn ②: train (Hydra entry point)
+│   └── infer_deepseek.py              #   Giai đoạn ③: infer + thống kê
+│
+├── uld/                               # 📦 Core engine (import bởi scripts)
+│   ├── data/
+│   │   ├── deepseek.py                #   DeepSeek_DataModule
+│   │   ├── datamodule.py              #   TorchDataset, TrainDataModule
+│   │   └── conv_util.py               #   ConvTemplate
+│   ├── model/
+│   │   ├── __init__.py                #   Model factory (TRAIN/EVAL_INIT_FUNCS)
+│   │   ├── utils.py                   #   create_full_model(), create_peft_model()
+│   │   ├── forget_losses.py           #   GradDescentLoss, KLLoss, NPOLoss, ...
+│   │   └── peft_util.py               #   LoRA utilities
+│   └── hfutil/
+│       ├── hf_trainers.py             #   ForgetTrainer (base)
+│       ├── cbd_dfb_trainer.py         #   CBDDFBForgetTrainer (gradient projection)
+│       ├── gmp_trainer.py             #   GPMForgetTrainer
+│       └── hf_callbacks.py            #   SimpleProfileCallback
+│
+└── data/deepseek/                     # 📊 Dữ liệu
+    ├── D_forget.json
+    ├── D_test_U_dep.json
+    └── D_test_U_nondep.json
 ```
 
-Black-box CBD-DFB ToFU10:
+## Artifacts (git-ignored)
 
-```bash
-python scripts/hf_forget_train.py repro blackbox tofu forget10 42 --top-k 192 --gpus 0
 ```
-
-Black-box CBD-DFB WMDP:
-
-```bash
-python scripts/hf_forget_train.py repro blackbox wmdp 42 --top-k 160 --gpus 0
+artifacts/
+├── basis_cbd_dfb/          # Output giai đoạn ①
+├── outputs_trained_models/ # Output giai đoạn ②
+└── eval_outputs/           # Output giai đoạn ③
 ```
-
-GPM ToFU:
-
-```bash
-python scripts/hf_forget_train.py repro gpm tofu forget10 42 --gpus 0
-```
-
-Sweep examples:
-
-```bash
-python scripts/hf_forget_train.py repro sweep topk tofu10 --values 32,64,96,128,160,192 --gpus 0
-python scripts/hf_forget_train.py repro sweep basis-retain wmdp --values 300,600,900,1200,1500 --gpus 0
-python scripts/hf_forget_train.py repro sweep lora-r tofu10 --values 16,32,48,64,80 --gpus 0
-python scripts/hf_forget_train.py repro sweep forget-steps tofu10 --values 60,120,180,240,300 --gpus 0
-```
-
-## Repository Contents
-
-- `scripts/hf_forget_train.py`: unified public entry point
-- `scripts/internal/`: internal implementations called by the unified entry point
-- `scripts/eval_*.py`, `scripts/extract_*.py`, `scripts/select_*.py`: evaluation, basis extraction, and threshold utilities
-- `configs/`: Hydra configurations used by the entry point
-- `uld/`: core data, model, and trainer code
-
-Internal scripts should not be used as public entry points directly.
