@@ -30,7 +30,7 @@ def build_lora_model(base_model_name, r, alpha, dropout, target_modules):
         base_model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        local_files_only=True,
+        local_files_only=False,
     )
     lora_config = LoraConfig(
         r=r,
@@ -548,7 +548,7 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model_name, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model_name, local_files_only=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     if args.dataset == "wmdp_mcq":

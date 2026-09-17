@@ -144,7 +144,7 @@ def main():
     # ── Load tokenizer ──
     print("=" * 60)
     print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(args.original_model_path, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.original_model_path, local_files_only=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -156,7 +156,7 @@ def main():
     original_model = AutoModelForCausalLM.from_pretrained(
         args.original_model_path,
         torch_dtype=torch.bfloat16,
-        local_files_only=True,
+        local_files_only=False,
     ).to(device)
     original_model.eval()
 
@@ -165,7 +165,7 @@ def main():
     finetuned_base = AutoModelForCausalLM.from_pretrained(
         args.original_model_path,
         torch_dtype=torch.bfloat16,
-        local_files_only=True,
+        local_files_only=False,
     ).to(device)
     finetuned_model = PeftModel.from_pretrained(finetuned_base, args.finetuned_model_path)
     finetuned_model = finetuned_model.merge_and_unload()
