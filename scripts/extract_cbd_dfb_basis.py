@@ -551,25 +551,12 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.base_model_name, local_files_only=False)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    if args.dataset == "wmdp_mcq":
-        # MCQ prompts can be long; keep the suffix containing choices + "Answer:".
-        tokenizer.truncation_side = "left"
-        conv_template_cfg = {
-            "question_start_token": "",
-            "question_end_token": "",
-            # Add a trailing space so the next-token distribution corresponds to the choice letter.
-            "answer_token": " ",
-            # Preserve trailing space in answer_token (avoid .strip()).
-            "strip_prompt": False,
-            "max_len": args.max_len,
-        }
-    else:
-        conv_template_cfg = {
-            "question_start_token": "question: ",
-            "question_end_token": " answer:",
-            "answer_token": "",
-            "max_len": args.max_len,
-        }
+    conv_template_cfg = {
+        "question_start_token": "",
+        "question_end_token": "",
+        "answer_token": "",
+        "max_len": args.max_len,
+    }
     conv_template = create_template(conv_template_cfg, tokenizer=tokenizer, max_len=args.max_len)
 
     model = build_lora_model(
