@@ -39,6 +39,9 @@ EVAL_OUTPUT_DIR="artifacts/eval_outputs/deepseek"
 INFER_BATCH_SIZE=4
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Thêm đường dẫn hiện tại vào PYTHONPATH để import được uld
+export PYTHONPATH="$(pwd):$PYTHONPATH"
+
 # Tự động tìm basis file path
 BASIS_FILE="${BASIS_OUTPUT_DIR}/cbd_dfb_basis_deepseek_forget_vs_deepseek_retain.pkl"
 
