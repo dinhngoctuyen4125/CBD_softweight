@@ -124,11 +124,11 @@ def main():
                         help="Path to the original (pre-unlearning) model")
     parser.add_argument("--finetuned_model_path", type=str, required=True,
                         help="Path to the finetuned (post-unlearning) LoRA checkpoint")
-    parser.add_argument("--valid_data_path", type=str, default="data/deepseek/D_forget.json",
+    parser.add_argument("--valid_data_path", type=str, default="../Data-Collection/deepseek/D_forget.json",
                         help="Path to D_forget.json (will use 20%% as valid)")
-    parser.add_argument("--test_dep_path", type=str, default="data/deepseek/D_test_U_dep.json",
+    parser.add_argument("--test_dep_path", type=str, default="../Data-Collection/deepseek/D_test_U_dep.json",
                         help="Path to D_test_U_dep.json")
-    parser.add_argument("--test_nondep_path", type=str, default="data/deepseek/D_test_U_nondep.json",
+    parser.add_argument("--test_nondep_path", type=str, default="../Data-Collection/deepseek/D_test_U_nondep.json",
                         help="Path to D_test_U_nondep.json")
     parser.add_argument("--output_dir", type=str, default="artifacts/eval_outputs/deepseek",
                         help="Output directory for results")

@@ -496,7 +496,7 @@ def main():
     parser = argparse.ArgumentParser(description="Extract CBD-DFB basis from gradients")
     parser.add_argument("--base_model_name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     parser.add_argument("--seed", type=int, default=42, help="随机种子（用于对齐 LoRA A 初始化）")
-    parser.add_argument("--data_path", type=str, default="data/deepseek/D_forget.json", help="Path to DeepSeek D_forget.json")
+    parser.add_argument("--data_path", type=str, default="../Data-Collection/deepseek/D_forget.json", help="Path to DeepSeek D_forget.json")
     parser.add_argument("--train_ratio", type=float, default=0.8, help="Train/valid split ratio for DeepSeek data")
     parser.add_argument("--max_forget", type=int, default=400)
     parser.add_argument("--max_retain", type=int, default=400)

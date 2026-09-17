@@ -12,7 +12,7 @@ conda activate cbd
 ## Dữ Liệu
 
 ```
-data/deepseek/
+../Data-Collection/deepseek/
 ├── D_forget.json          # 9667 mẫu (train + valid, 80/20)
 │                          #   "probing input" → prompt
 │                          #   "y_neg" → deprecated API (forget)
@@ -43,7 +43,7 @@ Tạo LoRA trên TinyLlama, thu gradient per-sample trên forget/retain, giải 
 
 ```bash
 python scripts/extract_cbd_dfb_basis.py \
-    --data_path data/deepseek/D_forget.json \
+    --data_path ../Data-Collection/deepseek/D_forget.json \
     --max_forget 7733 --max_retain 7733 \
     --top_k 192 --batch_size 4 --max_len 512 \
     --output_dir artifacts/basis_cbd_dfb/deepseek_seed42
@@ -73,9 +73,9 @@ Tính `score = CE_finetuned - CE_original` trên valid set → tìm threshold, s
 python scripts/infer_deepseek.py \
     --original_model_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --finetuned_model_path artifacts/outputs_trained_models/cbd_dfb_deepseek/<checkpoint> \
-    --valid_data_path data/deepseek/D_forget.json \
-    --test_dep_path data/deepseek/D_test_U_dep.json \
-    --test_nondep_path data/deepseek/D_test_U_nondep.json \
+    --valid_data_path ../Data-Collection/deepseek/D_forget.json \
+    --test_dep_path ../Data-Collection/deepseek/D_test_U_dep.json \
+    --test_nondep_path ../Data-Collection/deepseek/D_test_U_nondep.json \
     --output_dir artifacts/eval_outputs/deepseek
 ```
 
@@ -117,7 +117,7 @@ CBD_softweight/
 │       ├── gmp_trainer.py             #   GPMForgetTrainer
 │       └── hf_callbacks.py            #   SimpleProfileCallback
 │
-└── data/deepseek/                     # 📊 Dữ liệu
+└── ../Data-Collection/deepseek/   # 📊 Dữ liệu
     ├── D_forget.json
     ├── D_test_U_dep.json
     └── D_test_U_nondep.json

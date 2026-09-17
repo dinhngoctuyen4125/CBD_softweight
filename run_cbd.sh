@@ -18,9 +18,9 @@ set -e  # Dừng nếu có lỗi
 
 # ── Cấu hình ──────────────────────────────────────────────────────────────────
 SEED=42
-DATA_PATH="data/deepseek/D_forget.json"
-TEST_DEP_PATH="data/deepseek/D_test_U_dep.json"
-TEST_NONDEP_PATH="data/deepseek/D_test_U_nondep.json"
+DATA_PATH="../Data-Collection/deepseek/D_forget.json"
+TEST_DEP_PATH="../Data-Collection/deepseek/D_test_U_dep.json"
+TEST_NONDEP_PATH="../Data-Collection/deepseek/D_test_U_nondep.json"
 BASE_MODEL="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 # Giai đoạn ① — Basis extraction
