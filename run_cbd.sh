@@ -41,6 +41,7 @@ INFER_BATCH_SIZE=4
 
 # Thêm đường dẫn hiện tại vào PYTHONPATH để import được uld
 export PYTHONPATH="$(pwd):$PYTHONPATH"
+export PYTHONUNBUFFERED=1
 
 # Tự động tìm basis file path
 BASIS_FILE="${BASIS_OUTPUT_DIR}/cbd_dfb_basis_deepseek_forget_vs_deepseek_retain.pkl"
