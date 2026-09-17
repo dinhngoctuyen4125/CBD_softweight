@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - data: tofu
+  - data: deepseek
   - data_mode: forget_retain
   - model: tinyllama
   - model_mode: base_freeze_a
@@ -19,16 +19,16 @@ gmp_project_forget_only: false
 
 trainer:
   strategy: none
-  batch_size: 2
-  gradient_accumulation_steps: 4
+  batch_size: 4
+  gradient_accumulation_steps: 2
   max_epochs: 10
-  learning_rate: 2e-4
+  learning_rate: 1.5e-4
   warmup_ratio: 0.1
   weight_decay: 0.01
   seed: 42
   eval_steps: 1000
 
-project: cbd_dfb_tinyllama_paper
+project: cbd_dfb_deepseek
 name: null
 debug: false
 resume: false
@@ -38,8 +38,8 @@ seed: 42
 lora_seed: ${seed}
 
 save_dir: artifacts/outputs/model_dir/
-BASELOGDIR: "artifacts/outputs/cbd_dfb_log"
-OUTPUTMODELDIR: "artifacts/outputs_trained_models/cbd_dfb_tinyllama"
+BASELOGDIR: "artifacts/outputs/cbd_dfb_log_deepseek"
+OUTPUTMODELDIR: "artifacts/outputs_trained_models/cbd_dfb_deepseek"
 
 hydra:
   run:

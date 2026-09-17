@@ -23,100 +23,6 @@ from peft import LoraConfig, get_peft_model
 from uld.data.conv_util import create_template
 
 
-def load_local_tofu(split_name):
-    local_tofu_path = os.environ.get("TOFU_DATA_NAME") or os.path.join(
-        os.environ.get("CBD_DATA_ROOT", "data"), "TOFU"
-    )
-    json_file = os.path.join(local_tofu_path, f"{split_name}.json")
-    if not os.path.exists(json_file):
-        from datasets import load_dataset
-        return load_dataset("locuslab/TOFU", split_name)["train"]
-
-    try:
-        with open(json_file, "r", encoding="utf-8") as f:
-            first_non_ws = ""
-            while True:
-                ch = f.read(1)
-                if not ch:
-                    break
-                if not ch.isspace():
-                    first_non_ws = ch
-                    break
-            f.seek(0)
-            if first_non_ws == "[":
-                data = json.load(f)
-            else:
-                data = []
-                for line in f:
-                    if line.strip():
-                        data.append(json.loads(line.strip()))
-    except json.JSONDecodeError:
-        data = []
-        with open(json_file, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    data.append(json.loads(line.strip()))
-    return datasets.Dataset.from_list(data)
-
-def _read_jsonl(path: str):
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
-    return rows
-
-
-def _format_mcq_prompt(subject: str, question: str, choices):
-    subject = str(subject).replace("_", " ").strip()
-    a, b, c, d = (list(choices) + ["", "", "", ""])[:4]
-    return (
-        f"The following are multiple choice questions (with answers) about {subject}.\n\n"
-        f"{question}\n\n"
-        f"A. {a}\n\n"
-        f"B. {b}\n\n"
-        f"C. {c}\n\n"
-        f"D. {d}\n\n"
-        f"Answer:"
-    )
-
-
-def _ans_letter(answer_idx: int) -> str:
-    return ["A", "B", "C", "D"][int(answer_idx)]
-
-
-def load_wmdp_mcq(domains_csv: str):
-    data_root = os.environ.get("CBD_DATA_ROOT", "data")
-    domain_map = {"bio": ("bio_questions.json", "biology"), "cyber": ("cyber_questions.json", "cybersecurity"), "chem": ("chem_questions.json", "chemistry")}
-    domains = [d.strip().lower() for d in str(domains_csv).split(",") if d.strip()]
-    rows = []
-    for d in domains:
-        if d not in domain_map:
-            raise ValueError(f"Unknown WMDP domain: {d!r} (expected one of {sorted(domain_map)})")
-        fname, subject = domain_map[d]
-        path = os.path.join(data_root, "eval-method", "wmdp", "data", "wmdp_mcqs", "wmdp-mcqs", fname)
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        for ex in data:
-            prompt = _format_mcq_prompt(subject, ex["question"], ex["choices"])
-            rows.append({"question": prompt, "answer": _ans_letter(ex["answer"])})
-    return datasets.Dataset.from_list(rows)
-
-
-def load_mmlu_mcq(jsonl_path: str, subjects_csv=None):
-    rows = []
-    subjects = None
-    if subjects_csv:
-        subjects = {s.strip() for s in subjects_csv.split(",") if s.strip()}
-    for ex in _read_jsonl(jsonl_path):
-        subject = ex.get("subject") or "general"
-        if subjects is not None and subject not in subjects:
-            continue
-        prompt = _format_mcq_prompt(subject, ex["question"], ex["choices"])
-        rows.append({"question": prompt, "answer": _ans_letter(ex["answer"])})
-    return datasets.Dataset.from_list(rows)
 
 
 def build_lora_model(base_model_name, r, alpha, dropout, target_modules):
@@ -590,12 +496,8 @@ def main():
     parser = argparse.ArgumentParser(description="Extract CBD-DFB basis from gradients")
     parser.add_argument("--base_model_name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     parser.add_argument("--seed", type=int, default=42, help="随机种子（用于对齐 LoRA A 初始化）")
-    parser.add_argument("--dataset", type=str, default="tofu", choices=["tofu", "wmdp_mcq"], help="数据来源：ToFU(split) 或 WMDP/MMLU(MCQ)")
-    parser.add_argument("--forget_split", type=str, default=None, help="ToFU forget split（dataset=tofu 时必填）")
-    parser.add_argument("--retain_split", type=str, default=None, help="ToFU retain split（dataset=tofu 时必填）")
-    parser.add_argument("--wmdp_domains", type=str, default="bio,cyber", help="WMDP domains for forget (dataset=wmdp_mcq)")
-    parser.add_argument("--mmlu_retain_file", type=str, default="eval-method/wmdp/data/mmlu/all_auxiliary_train.jsonl", help="Local MMLU JSONL (run scripts/cache_mmlu.py)")
-    parser.add_argument("--mmlu_retain_subjects", type=str, default=None, help="Optional comma-separated subject filter for MMLU retain")
+    parser.add_argument("--data_path", type=str, default="data/deepseek/D_forget.json", help="Path to DeepSeek D_forget.json")
+    parser.add_argument("--train_ratio", type=float, default=0.8, help="Train/valid split ratio for DeepSeek data")
     parser.add_argument("--max_forget", type=int, default=400)
     parser.add_argument("--max_retain", type=int, default=400)
     parser.add_argument("--max_len", type=int, default=256)
@@ -683,26 +585,31 @@ def main():
         if "lora_A" in name:
             param.requires_grad = False
 
-    if args.dataset == "wmdp_mcq":
-        mmlu_path = args.mmlu_retain_file
-        if not os.path.isabs(mmlu_path):
-            mmlu_path = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), mmlu_path)
-        if not os.path.exists(mmlu_path):
-            raise FileNotFoundError(
-                f"MMLU retain file not found: {mmlu_path}. "
-                f"Run: HF_ENDPOINT=https://hf-mirror.com python3 scripts/cache_mmlu.py"
-            )
-        forget_ds = load_wmdp_mcq(args.wmdp_domains)
-        retain_ds = load_mmlu_mcq(mmlu_path, subjects_csv=args.mmlu_retain_subjects)
-        forget_tag = f"wmdp_{args.wmdp_domains.replace(',', '_')}"
-        retain_tag = "mmlu"
-    else:
-        if not args.forget_split or not args.retain_split:
-            raise ValueError("--forget_split and --retain_split are required when --dataset=tofu")
-        forget_ds = load_local_tofu(args.forget_split)
-        retain_ds = load_local_tofu(args.retain_split)
-        forget_tag = args.forget_split
-        retain_tag = args.retain_split
+    # Load DeepSeek data
+    data_path = args.data_path
+    if not os.path.isabs(data_path):
+        data_path = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), data_path)
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Data file not found: {data_path}")
+    print(f"[DeepSeek] Loading data from {data_path}")
+    with open(data_path, "r", encoding="utf-8") as f:
+        raw_data = json.load(f)
+    # Split into train/valid, only use train portion for basis extraction
+    n_total = len(raw_data)
+    n_train = int(n_total * args.train_ratio)
+    indices = list(range(n_total))
+    rng = random.Random(args.seed)
+    rng.shuffle(indices)
+    train_indices = sorted(indices[:n_train])
+    train_data = [raw_data[i] for i in train_indices]
+    # Build forget (y_neg) and retain (y_pos) datasets
+    forget_list = [{"question": item["probing input"], "answer": item["y_neg"]} for item in train_data if item.get("probing input") and item.get("y_neg")]
+    retain_list = [{"question": item["probing input"], "answer": item["y_pos"]} for item in train_data if item.get("probing input") and item.get("y_pos")]
+    forget_ds = datasets.Dataset.from_list(forget_list)
+    retain_ds = datasets.Dataset.from_list(retain_list)
+    forget_tag = "deepseek_forget"
+    retain_tag = "deepseek_retain"
+    print(f"[DeepSeek] Train split: {len(train_data)}/{n_total} samples, forget={len(forget_ds)}, retain={len(retain_ds)}")
 
     if args.refuse_forget:
         replaced = []
