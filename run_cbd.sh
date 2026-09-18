@@ -24,9 +24,12 @@ TEST_NONDEP_PATH="../Data-Collection/deepseek/D_test_U_nondep.json"
 BASE_MODEL="TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 # Giai đoạn ① — Basis extraction
+# Dùng TOÀN BỘ D_forget (không chia train/valid nữa): threshold được dò trên
+# 200 mẫu tách ra từ hai tập test, xem giai đoạn ③.
 BASIS_OUTPUT_DIR="artifacts/basis_cbd_dfb/deepseek_seed${SEED}"
-MAX_FORGET=7733      # 80% của 9667
-MAX_RETAIN=7733
+TRAIN_RATIO=1.0
+MAX_FORGET=9667      # toàn bộ D_forget
+MAX_RETAIN=9667
 TOP_K=192
 BASIS_BATCH_SIZE=4
 MAX_LEN=512
@@ -36,7 +39,10 @@ HYDRA_CONFIG="cbd_dfb_deepseek"
 
 # Giai đoạn ③ — Inference
 EVAL_OUTPUT_DIR="artifacts/eval_outputs/deepseek"
-INFER_BATCH_SIZE=4
+INFER_BATCH_SIZE=8
+PROMPT_FIELD="probing input"
+CALIB_DEP_N=200
+CALIB_NONDEP_N=200
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Thêm đường dẫn hiện tại vào PYTHONPATH để import được uld
@@ -53,9 +59,10 @@ find_latest_checkpoint() {
         echo ""
         return
     fi
-    # Tìm thư mục checkpoint mới nhất chứa adapter_config.json
-    find "$ckpt_dir" -name "adapter_config.json" -printf '%h\n' 2>/dev/null \
-        | sort -r | head -1
+    # Checkpoint mới nhất theo THỜI GIAN, không theo tên: sort chuỗi sẽ coi
+    # checkpoint-9 mới hơn checkpoint-100.
+    find "$ckpt_dir" -name "adapter_config.json" -printf '%T@ %h\n' 2>/dev/null \
+        | sort -rn | head -1 | cut -d' ' -f2-
 }
 
 # Chọn giai đoạn chạy
@@ -78,6 +85,7 @@ run_basis() {
     python scripts/extract_cbd_dfb_basis.py \
         --data_path "${DATA_PATH}" \
         --base_model_name "${BASE_MODEL}" \
+        --train_ratio ${TRAIN_RATIO} \
         --max_forget ${MAX_FORGET} \
         --max_retain ${MAX_RETAIN} \
         --top_k ${TOP_K} \
@@ -109,7 +117,8 @@ run_train() {
         exit 1
     fi
 
-    python scripts/hf_forget_train.py \
+    # Không còn tập valid (train_ratio=1.0) nên phải tắt eval nội bộ của Trainer.
+    DISABLE_INTERNAL_EVAL=1 python scripts/hf_forget_train.py \
         --config-name "${HYDRA_CONFIG}" \
         enable_cbd_dfb=true \
         cbd_dfb_basis_path="${BASIS_FILE}" \
@@ -150,6 +159,9 @@ run_infer() {
         --test_dep_path "${TEST_DEP_PATH}" \
         --test_nondep_path "${TEST_NONDEP_PATH}" \
         --output_dir "${EVAL_OUTPUT_DIR}" \
+        --prompt_field "${PROMPT_FIELD}" \
+        --calib_dep_n ${CALIB_DEP_N} \
+        --calib_nondep_n ${CALIB_NONDEP_N} \
         --batch_size ${INFER_BATCH_SIZE} \
         --max_len ${MAX_LEN} \
         --seed ${SEED}
