@@ -8,10 +8,16 @@
 #   ③ Infer trên test sets + thống kê score
 #
 # Cách dùng:
-#   bash run_cbd.sh              # Chạy cả 3 giai đoạn
+#   bash run_cbd.sh              # Chạy tiếp từ chỗ đang dở (bỏ qua giai đoạn đã xong)
+#   bash run_cbd.sh status       # Chỉ xem đang ở đâu, không chạy gì
 #   bash run_cbd.sh basis        # Chỉ chạy giai đoạn ①
 #   bash run_cbd.sh train        # Chỉ chạy giai đoạn ②
 #   bash run_cbd.sh infer        # Chỉ chạy giai đoạn ③
+#
+# Biến môi trường hay dùng:
+#   FORCE=1                      # chạy lại cả giai đoạn đã có output
+#   TEST_NONDEP_N=500            # giai đoạn ③ chỉ chấm 500 mẫu âm cho nhanh
+#   TRAIN_EPOCHS=1               # train ngắn hơn
 # ==============================================================================
 
 set -e  # Dừng nếu có lỗi
@@ -79,6 +85,84 @@ find_latest_checkpoint() {
         | sort -rn | head -1 | cut -d' ' -f2-
 }
 
+FORCE="${FORCE:-0}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PREFLIGHT — kiểm mọi thứ cần thiết TRƯỚC khi tốn hàng giờ tính toán
+# ══════════════════════════════════════════════════════════════════════════════
+preflight() {
+    local fail=0
+
+    for f in "${DATA_PATH}" "${TEST_DEP_PATH}" "${TEST_NONDEP_PATH}"; do
+        if [ ! -f "$f" ]; then
+            echo "❌ Thiếu dữ liệu: $f"; fail=1
+        fi
+    done
+
+    # uld phải import được. `python script.py` đặt sys.path[0] = thư mục chứa script,
+    # KHÔNG phải thư mục hiện tại — nên PYTHONPATH ở trên là bắt buộc.
+    if ! python -c "import uld, uld.data.deepseek" 2>/dev/null; then
+        echo "❌ Không import được uld — kiểm tra conda env đã activate chưa"; fail=1
+    fi
+
+    for m in torch transformers peft hydra omegaconf datasets; do
+        python -c "import $m" 2>/dev/null || { echo "❌ Thiếu module: $m"; fail=1; }
+    done
+
+    # matplotlib chỉ cần cho biểu đồ ở giai đoạn ③ — thiếu thì cảnh báo, không chặn.
+    if ! python -c "import matplotlib" 2>/dev/null; then
+        echo "⚠️  Thiếu matplotlib → giai đoạn ③ sẽ bỏ qua routing_histogram.png"
+        echo "    pip install matplotlib==3.8.4"
+    fi
+
+    if [ "$fail" = "1" ]; then
+        exit 1
+    fi
+    return 0
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATUS — pipeline đang ở đâu
+# ══════════════════════════════════════════════════════════════════════════════
+show_status() {
+    echo ""
+    echo "════════════════════════════════════════════════════════════════"
+    echo "  TRẠNG THÁI PIPELINE"
+    echo "════════════════════════════════════════════════════════════════"
+
+    if [ -f "${BASIS_FILE}" ]; then
+        echo "  ① basis   ✅ $(du -h "${BASIS_FILE}" | cut -f1)  ${BASIS_FILE}"
+    else
+        echo "  ① basis   ❌ chưa có"
+    fi
+
+    local n_ckpt
+    n_ckpt=$(find artifacts/outputs_trained_models -name adapter_config.json 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${n_ckpt}" -gt 0 ]; then
+        echo "  ② train   ✅ ${n_ckpt} checkpoint"
+        find artifacts/outputs_trained_models -name adapter_config.json \
+            -printf '              %TY-%Tm-%Td %TH:%TM  %h\n' 2>/dev/null | sort
+    else
+        echo "  ② train   ❌ chưa có checkpoint"
+    fi
+
+    if [ -f "${EVAL_OUTPUT_DIR}/routing_statistics.json" ]; then
+        echo "  ③ infer   ✅ ${EVAL_OUTPUT_DIR}/routing_statistics.json"
+    else
+        echo "  ③ infer   ❌ chưa chạy"
+    fi
+
+    # pgrep trả 1 khi không khớp -> phải nuốt, nếu không set -e giết cả script
+    local running
+    running=$(pgrep -af "scripts/(extract_cbd_dfb_basis|hf_forget_train|infer_deepseek)\.py" 2>/dev/null | head -3 || true)
+    if [ -n "${running}" ]; then
+        echo ""
+        echo "  ⚠️  ĐANG CHẠY — đừng khởi động chồng lên:"
+        echo "${running}" | sed 's/^/      /'
+    fi
+    echo "════════════════════════════════════════════════════════════════"
+}
+
 # Chọn giai đoạn chạy
 STAGE="${1:-all}"
 
@@ -86,6 +170,10 @@ STAGE="${1:-all}"
 # GIAI ĐOẠN ①: TRÍCH XUẤT CBD-DFB BASIS
 # ══════════════════════════════════════════════════════════════════════════════
 run_basis() {
+    if [ -f "${BASIS_FILE}" ] && [ "${FORCE}" != "1" ]; then
+        echo "⏭  ① basis đã có, bỏ qua → ${BASIS_FILE}   (FORCE=1 để chạy lại)"
+        return 0
+    fi
     echo ""
     echo "════════════════════════════════════════════════════════════════"
     echo "  ① TRÍCH XUẤT CBD-DFB BASIS"
@@ -116,6 +204,10 @@ run_basis() {
 # GIAI ĐOẠN ②: TRAIN UNLEARN MODEL
 # ══════════════════════════════════════════════════════════════════════════════
 run_train() {
+    if [ -n "$(find_latest_checkpoint)" ] && [ "${FORCE}" != "1" ]; then
+        echo "⏭  ② đã có checkpoint, bỏ qua → $(find_latest_checkpoint)   (FORCE=1 để train lại)"
+        return 0
+    fi
     echo ""
     echo "════════════════════════════════════════════════════════════════"
     echo "  ② TRAIN UNLEARN MODEL (CBD-DFB)"
@@ -197,10 +289,13 @@ run_infer() {
 # DISPATCHER
 # ══════════════════════════════════════════════════════════════════════════════
 case "$STAGE" in
-    basis)  run_basis ;;
-    train)  run_train ;;
-    infer)  run_infer ;;
+    status) show_status; exit 0 ;;
+    basis)  preflight; run_basis ;;
+    train)  preflight; run_train ;;
+    infer)  preflight; run_infer ;;
     all)
+        preflight
+        show_status
         run_basis
         run_train
         run_infer
@@ -210,7 +305,7 @@ case "$STAGE" in
         echo "════════════════════════════════════════════════════════════════"
         ;;
     *)
-        echo "Cách dùng: bash run_cbd.sh [basis|train|infer|all]"
+        echo "Cách dùng: bash run_cbd.sh [status|basis|train|infer|all]"
         exit 1
         ;;
 esac
