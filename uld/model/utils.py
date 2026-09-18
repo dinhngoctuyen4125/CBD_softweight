@@ -1,5 +1,4 @@
 import os
-import copy 
 import torch
 
 from transformers import AutoModelForCausalLM
@@ -40,154 +39,12 @@ def _summarize_trainable_parameters(model, prefix=""):
     if hasattr(model, "print_trainable_parameters"):
         model.print_trainable_parameters()
 
-def _unique_modules(candidates):
-    mods = []
-    seen = set()
-    for module in candidates:
-        if module is None:
-            continue
-        ident = id(module)
-        if ident in seen:
-            continue
-        seen.add(ident)
-        mods.append(module)
-    return mods
 
-def _resolve_backbone(module):
-    candidates = _unique_modules([
-        module,
-        getattr(module, "model", None),
-        getattr(getattr(module, "model", None), "model", None),
-        getattr(module, "base_model", None),
-        getattr(getattr(module, "base_model", None), "model", None),
-        getattr(getattr(getattr(module, "base_model", None), "model", None), "model", None),
-    ])
-    for cand in candidates:
-        if hasattr(cand, "embed_tokens") and hasattr(cand, "layers") and hasattr(cand, "norm"):
-            return cand
-    return None
 
-def _resolve_lm_head(module):
-    candidates = _unique_modules([
-        module,
-        getattr(module, "model", None),
-        getattr(getattr(module, "model", None), "model", None),
-        getattr(module, "base_model", None),
-        getattr(getattr(module, "base_model", None), "model", None),
-        getattr(getattr(getattr(module, "base_model", None), "model", None), "model", None),
-    ])
-    for cand in candidates:
-        lm_head = getattr(cand, "lm_head", None)
-        if lm_head is not None:
-            return lm_head
-    return None
 
-def copy_weights(base_llm, model):
-    config = model.config
-    name = model.config._name_or_path.lower()
-    if ('llama' in name) or ('zephyr' in name) or ('mistral' in name):
-        print(f"Copying {name} first layer: {config.num_hidden_layers}")
-        src_backbone = _resolve_backbone(base_llm)
-        dst_backbone = _resolve_backbone(model)
-        if src_backbone is None or dst_backbone is None:
-            raise AttributeError(f"Cannot resolve model backbone for copy_weights: src={type(base_llm).__name__}, dst={type(model).__name__}")
-        dst_backbone.embed_tokens.load_state_dict(
-            src_backbone.embed_tokens.state_dict()
-        )
-        dst_backbone.norm.load_state_dict(
-            src_backbone.norm.state_dict()
-        )
-        for layer_num in range(config.num_hidden_layers):
-            dst_backbone.layers[layer_num].load_state_dict(
-                src_backbone.layers[layer_num].state_dict()
-            )
-        src_lm_head = _resolve_lm_head(base_llm)
-        dst_lm_head = _resolve_lm_head(model)
-        if src_lm_head is None or dst_lm_head is None:
-            raise AttributeError(f"Cannot resolve lm_head for copy_weights: src={type(base_llm).__name__}, dst={type(model).__name__}")
-        dst_lm_head.load_state_dict(src_lm_head.state_dict())
-        return model
-    else:
-        raise ValueError(f"Unsupported model: {name}")
 
-def init_small_llm(origin_config, num_layer, device, hparams=None, base_llm=None, saved_path=None):
-    config = copy.deepcopy(origin_config)
-    config.num_hidden_layers = num_layer
-    model = AutoModelForCausalLM.from_config(
-        config,
-        use_flash_attention_2=False, 
-        torch_dtype=torch.bfloat16, 
-    ).to('cuda')
 
-    if base_llm is not None:
-        copy_weights(base_llm, model)
-        
-    if saved_path is not None:
-        model.load_state_dict(
-            torch.load(saved_path)
-        )
 
-    return model
-
-def save_pretrained_compat(model, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-    try:
-        model.save_pretrained(out_dir, safe_serialization=False)
-        return
-    except TypeError:
-        # Older Transformers versions may not accept `safe_serialization`.
-        try:
-            model.save_pretrained(out_dir)
-            return
-        except ImportError as exc:
-            if "DTensor" not in str(exc):
-                raise
-    except ImportError as exc:
-        if "DTensor" not in str(exc):
-            raise
-    model.config.save_pretrained(out_dir)
-    if hasattr(model, "generation_config") and model.generation_config is not None:
-        try:
-            model.generation_config.save_pretrained(out_dir)
-        except Exception:
-            pass
-    try:
-        from safetensors.torch import save_model as safetensors_save_model
-        safetensors_save_model(model, os.path.join(out_dir, "model.safetensors"))
-        bin_path = os.path.join(out_dir, "pytorch_model.bin")
-        if os.path.exists(bin_path):
-            os.remove(bin_path)
-        return
-    except Exception:
-        pass
-    state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-    torch.save(state_dict, os.path.join(out_dir, "pytorch_model.bin"))
-
-# def create_full_model(model_path,Lora, num_layer=0 ,data_type='bfloat16', **kwargs):
-#     with NameTimer("Init full model"):
-#         basellm = AutoModelForCausalLM.from_pretrained(
-#             model_path, torch_dtype=get_dtype(data_type),
-#             use_flash_attention_2=True, trust_remote_code=True,
-#         )
-#         if Lora.r != 0:
-#             peftconfig = LoraConfig(
-#                 r=Lora.r,
-#                 lora_alpha=Lora.alpha,
-#                 target_modules=find_all_linear_names(basellm), 
-#                 lora_dropout=Lora.dropout,
-#                 bias=Lora.bias, 
-#                 task_type="CAUSAL_LM",
-#             )
-#             basellm = get_peft_model(basellm, peftconfig)
-
-#         if num_layer != 0: #! Construct the small model
-#             basellm = init_small_llm( 
-#                 basellm.model.config,
-#                 num_layer=num_layer,
-#                 base_llm=basellm,
-#                 device='cpu',
-#             )
-#         return basellm
 
 def _check_pure_gpu_device_map(model, tag: str):
     """检查模型的 device_map 是否全部在 GPU 上（不能有 CPU/disk）"""
@@ -206,7 +63,6 @@ def _check_pure_gpu_device_map(model, tag: str):
 def create_full_model(
     model_path,
     Lora,
-    num_layer=0,
     data_type='bfloat16',
     freeze_lora_a=False,
     attn_implementation=None,
@@ -235,13 +91,6 @@ def create_full_model(
             basellm = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
             if device_map is not None:
                 _check_pure_gpu_device_map(basellm, "official_basellm")
-            if num_layer != 0:
-                basellm = init_small_llm(
-                    basellm.model.config,
-                    num_layer=num_layer,
-                    base_llm=basellm,
-                    device='cpu',
-                )
             return basellm
     with NameTimer("Init full model"):
         if attn_implementation is None:
@@ -310,48 +159,6 @@ def create_full_model(
         if report_trainable_summary:
             _summarize_trainable_parameters(basellm)
          
-        if num_layer != 0: #! Construct the small model
-            basellm = init_small_llm(                 
-                basellm.model.config,
-                num_layer=num_layer,
-                base_llm=basellm,
-                device='cuda',
-            )
             
         return basellm
 
-def create_peft_model(model_path, Lora, baseoutdir, num_layer=0, data_type='bfloat16', **kwargs):
-    with NameTimer("Init peft model"):
-        print("[PEFT] 先构建未挂载 LoRA 的基座模型，随后再附加 LoRA 适配器。")
-        base_lora = copy.deepcopy(Lora)
-        if isinstance(base_lora, dict):
-            base_lora["r"] = 0
-        else:
-            if hasattr(base_lora, "r"):
-                base_lora.r = 0
-            try:
-                base_lora["r"] = 0
-            except Exception:
-                pass
-        basellm = create_full_model(
-            model_path,
-            base_lora,
-            num_layer,
-            data_type,
-            report_trainable_summary=False,
-            **kwargs,
-        )
-        if num_layer != 0:
-            save_pretrained_compat(basellm, os.path.join(baseoutdir, 'fullmodel'))
-        peftconfig = LoraConfig(
-            r=Lora.r,
-            lora_alpha=Lora.alpha,
-            target_modules=find_all_linear_names(basellm), 
-            lora_dropout=Lora.dropout,
-            bias=Lora.bias, 
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(basellm, peftconfig)
-        print(f"[PEFT] 已附加 LoRA 适配器: r={Lora.r}, alpha={Lora.alpha}, dropout={Lora.dropout}")
-        _summarize_trainable_parameters(model, prefix="[PEFT] ")
-        return model

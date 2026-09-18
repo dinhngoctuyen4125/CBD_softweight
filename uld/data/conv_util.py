@@ -1,6 +1,5 @@
-import torch
 from omegaconf import OmegaConf
-from typing import List, Optional, Tuple, Any
+from typing import Any
 
 def create_template(template_config : dict, tokenizer=None, max_len=200) -> Any:
     template_config = OmegaConf.create(template_config)
@@ -63,7 +62,3 @@ class ConvTemplate:
             print(kwargs.keys())
             raise ValueError("Unkown input for conv template")
             
-    def prepare_batch_prompt(self, question, choices, **kwargs):
-        return [
-            self.prepare_prompt(question=question, answer=choice) for choice in choices
-        ]

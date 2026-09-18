@@ -1,3 +1,0 @@
-model_name: zephyr7b
-model_path: HuggingFaceH4/zephyr-7b-beta
-tokenizer_path: HuggingFaceH4/zephyr-7b-beta

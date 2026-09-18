@@ -13,9 +13,6 @@ cbd_dfb_trust_region: false
 cbd_dfb_trust_region_epsilon: 1e-3
 cbd_dfb_trust_region_delta: 1e-12
 cbd_dfb_project_forget_only: false
-enable_gmp: false
-gmp_basis_path: ""
-gmp_project_forget_only: false
 
 trainer:
   strategy: none
@@ -55,9 +52,6 @@ hydra:
           - cbd_dfb_trust_region_epsilon
           - cbd_dfb_trust_region_delta
           - cbd_dfb_project_forget_only
-          - enable_gmp
-          - gmp_basis_path
-          - gmp_project_forget_only
           - save_dir
           - BASELOGDIR
           - OUTPUTMODELDIR

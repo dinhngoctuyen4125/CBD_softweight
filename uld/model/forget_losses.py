@@ -5,7 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Any
 from transformers import AutoModelForCausalLM
-from functools import partial
 
 # Utility functions
 def _move_to_device(tensor, device):
@@ -129,20 +128,6 @@ class ForgetRetainLoss:
             'forget_loss': forget_loss,
             'retain_loss': retain_loss 
         }
-
-# For RMU
-class RMULoss(ForgetRetainLoss):
-    def __init__(self, forget_loss_func, retain_loss_func, model_config, layerid, retain_weight=1200, steering_coeff=6.5) -> None:
-        super().__init__(forget_loss_func, retain_loss_func, retain_weight=retain_weight)
-        random_vector = torch.rand(1, 1, model_config.hidden_size, dtype=torch.float32)
-        control_vec = random_vector / torch.norm(random_vector) * steering_coeff
-        self.control_vec = control_vec
-        self.layerid = layerid
-
-        #! wrap new params for forget/retain loss
-        self.forget_loss_func = partial(forget_loss_func, control_vec=control_vec, layerid=layerid)
-        self.retain_loss_func = partial(retain_loss_func, control_vec=control_vec, layerid=layerid)
-   
 
 # For DPO
 class PreferLoss(ForgetRetainLoss):

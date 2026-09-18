@@ -6,20 +6,9 @@
 
 import logging
 import logging.config
-from typing import Any
 import structlog
 from structlog import DropEvent
 
-class Dropper:
-    def __init__(self, dropkey, dropval):
-        self._dropkey = dropkey
-        self._dropval = dropval
-
-    def __call__(self, logger, method_name, event_dict):
-        if event_dict.get(self._dropkey) == self._dropval:
-            raise DropEvent
-
-        return event_dict
 
 
 def drop_httpx(logger, method_name, event_dict):

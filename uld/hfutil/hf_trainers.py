@@ -1,6 +1,5 @@
 import copy 
 import os
-from functools import partial
 
 import torch
 try:
@@ -10,16 +9,12 @@ except Exception:
 import datasets
 from transformers.utils import is_datasets_available
 from transformers.trainer_utils import seed_worker
-from torch.nn import CrossEntropyLoss
-from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, RandomSampler
 from transformers import Trainer
-from transformers.trainer_callback import TrainerCallback, TrainerControl, TrainerState
 from transformers.trainer_utils import has_length
-from typing import Callable, Dict, Optional
-import numpy as np
+from typing import Callable, Optional
 import inspect
 
-from transformers.training_args import TrainingArguments
 from ..data.datamodule import EqualForgetRetainSampler
 
 

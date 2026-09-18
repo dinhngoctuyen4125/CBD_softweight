@@ -137,39 +137,6 @@ class CBDDFBForgetTrainer(ForgetTrainer):
             self._project_param_bindings = tuple(bindings)
         return self._project_param_bindings
 
-    def _project_gradient_csm(self, gradients: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        if not self.enable_cbd_dfb or self.csm_basis is None:
-            return gradients
-
-        projected = {}
-        for name, grad in gradients.items():
-            if grad is None:
-                continue
-            if 'lora_B' not in name or 'up_proj' not in name or 'default' not in name:
-                projected[name] = grad
-                continue
-
-            basis_key = self._resolve_basis_key(name)
-            if basis_key is None:
-                projected[name] = grad
-                continue
-
-            Q_T, Q, w, _, _ = self._get_cached_basis(basis_key, device=grad.device)
-
-            if grad.dim() != 2:
-                projected[name] = grad
-                continue
-
-            # Flatten [out_dim, r] -> [d], project, then reshape back.
-            g = grad
-            gvec = g.reshape(-1)
-            coeff = torch.matmul(Q_T, gvec)  # [k]
-            if w is not None:
-                coeff = coeff * w
-            proj_vec = torch.matmul(Q, coeff)  # [d]
-            projected[name] = proj_vec.reshape_as(g)
-
-        return projected
 
     def _get_cached_basis(self, basis_key: str, device: torch.device):
         cache_key = (basis_key, str(device))

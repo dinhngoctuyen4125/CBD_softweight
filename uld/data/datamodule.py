@@ -234,10 +234,3 @@ class TrainDataModule(LightningDataModule):
             self.to_loader(valset, shuffle=False) for valset in valsets.values()
         ]
     
-    def stats(self):
-        return {
-            "train": {"forget num": self.forget_length, "retain num": len(self.forget_train) - self.forget_length, "forget mode": self.forget_train.answer_key, "dpo mode": self.forget_train.as_dpo},
-            "val": {
-                k: len(v) for k, v in self.val_set()
-            }
-        }

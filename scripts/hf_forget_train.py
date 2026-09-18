@@ -1,4 +1,4 @@
-﻿#! This script initializes a small LLM and finetune for unlearning (CBD-DFB)
+#! This script initializes a small LLM and finetune for unlearning (CBD-DFB)
 import os
 import sys
 
@@ -25,7 +25,6 @@ from uld.model.utils import get_dtype
 from uld.hfutil import ForgetTrainer, SimpleProfileCallback
 os.environ['TOKENIZERS_PARALLELISM'] = 'False'
 
-from uld.hfutil.gmp_trainer import GPMForgetTrainer
 from uld.hfutil.cbd_dfb_trainer import CBDDFBForgetTrainer
 
 
@@ -150,7 +149,7 @@ def _load_oracle_model_unsharded(model_path, torch_dtype=torch.bfloat16):
             pass
 
 
-@hydra.main(version_base=None, config_path="../configs", config_name="tune_config")
+@hydra.main(version_base=None, config_path="../configs", config_name="cbd_dfb_deepseek")
 def main(configs):
     local_rank = 0
     exact_deterministic = os.environ.get("TRAIN_EXACT_DETERMINISTIC", "0") == "1"
@@ -480,7 +479,12 @@ def main(configs):
     #! Setup model
     baseoutdir = checkpoint_dir
     model_mode = configs.get('model_mode', None)
-    init_func = TRAIN_INIT_FUNCS.get(model_mode.get('mode', 'base'))
+    mode_name = model_mode.get('mode', 'base')
+    if mode_name not in TRAIN_INIT_FUNCS:
+        raise ValueError(
+            f"Unknown model_mode.mode={mode_name!r}; supported: {sorted(TRAIN_INIT_FUNCS)}"
+        )
+    init_func = TRAIN_INIT_FUNCS[mode_name]
 
     # 如果使用四卡模型并行，传递 device_map
     if use_model_parallel:
@@ -602,9 +606,6 @@ def main(configs):
     cbd_dfb_trust_region_delta = float(configs.get('cbd_dfb_trust_region_delta', 1e-12))
     cbd_dfb_project_forget_only = bool(configs.get('cbd_dfb_project_forget_only', False))
     oracle_on_cpu = bool(configs.get('oracle_on_cpu', False))
-    enable_gmp = configs.get('enable_gmp', False)
-    gmp_basis_path = configs.get('gmp_basis_path', './gmp_basis/retain99_pca_basis.pkl')
-    gmp_project_forget_only = bool(configs.get('gmp_project_forget_only', False))
 
     if enable_cbd_dfb:
         if not cbd_dfb_basis_path:
@@ -629,25 +630,6 @@ def main(configs):
             trust_region_epsilon=cbd_dfb_trust_region_epsilon,
             trust_region_delta=cbd_dfb_trust_region_delta,
             project_forget_only=cbd_dfb_project_forget_only,
-            oracle_on_cpu=oracle_on_cpu,
-        )
-    elif enable_gmp:
-        print(f"🚀 使用GPM训练器，基底路径: {gmp_basis_path}")
-        trainer = GPMForgetTrainer(
-            model=model,
-            train_loss_function=loss_function,
-            oracle_model=oracle_model,
-            equal_sampler=requires_equal_sampler,
-            is_deepspeed=is_deepspeed,
-            train_dataset=train_set,
-            eval_dataset=None if disable_internal_eval else val_set,
-            seed=configs.get('seed', 42),
-            callbacks=custom_callbacks,
-            args=training_args,
-            is_offset=is_offset,
-            gmp_basis_path=gmp_basis_path,
-            enable_gmp=True,
-            project_forget_only=gmp_project_forget_only,
             oracle_on_cpu=oracle_on_cpu,
         )
     else:

@@ -1,18 +1,28 @@
-import os
 from setuptools import setup, find_packages
-
-def read_requirements():
-    return open(os.path.join(os.path.dirname(__file__), 'requirements.txt')).readlines()
 
 setup(
     name='uld',
     version='1.0',
     packages=find_packages(),
-    install_requires=read_requirements(),
-    author='Jiabao Ji',
-    author_email='jiabaoji@ucsb.edu',
-    description='This is ',
+    # Phiên bản được ghim trong environment.yaml (conda). Ở đây chỉ khai các gói
+    # thực sự được import, không đọc requirements.txt — file đó đã bị xoá khỏi repo.
+    install_requires=[
+        'torch',
+        'transformers',
+        'peft',
+        'datasets',
+        'accelerate',
+        'hydra-core',
+        'omegaconf',
+        'safetensors',
+        'structlog',
+        'codetiming',
+        'lightning',
+        'pytorch-lightning',
+        'pandas',
+        'numpy',
+        'matplotlib',
+    ],
+    description='CBD-DFB: discriminative-subspace unlearning for deprecated-API detection',
     license='MIT',
-    keywords='LLM Unlearning, LLM, Machine Leanring',
-    url='',
 )

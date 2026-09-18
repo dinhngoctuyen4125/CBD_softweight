@@ -1,6 +1,22 @@
-# CBD-DFB — Discriminative Subspace Unlearning for DeepSeek
+# CBD-DFB — Discriminative Subspace Unlearning cho DeepSeek
 
-Pipeline học unlearning trên dữ liệu DeepSeek deprecated API, sử dụng phương pháp CBD-DFB (gradient projection lên discriminative subspace).
+Pipeline dò code dùng API đã deprecated, bằng phương pháp CBD-DFB: chiếu gradient lên
+không gian con phân biệt giữa `y_neg` (API cũ) và `y_pos` (API mới).
+
+Hai mô hình nhỏ tạo thành bộ dò:
+
+- **M_ref** — TinyLlama gốc, đóng băng
+- **M_pro** — TinyLlama + LoRA, huấn luyện để lệch khỏi M_ref đúng trên ngữ cảnh deprecated
+
+Điểm phân loại là **symmetric KL divergence** giữa hai phân phối dự đoán tại token cuối
+của prompt:
+
+```
+s(x) = 0.5 * ( KL(p_M_ref || p_M_pro) + KL(p_M_pro || p_M_ref) )
+
+x dùng API deprecated  →  kỳ vọng s(x) CAO
+x bình thường          →  kỳ vọng s(x) THẤP
+```
 
 ## Cài Đặt
 
@@ -13,115 +29,111 @@ conda activate cbd
 
 ```
 ../Data-Collection/deepseek/
-├── D_forget.json          # 9667 mẫu (train + valid, 80/20)
+├── D_forget.json          # 9667 mẫu — dùng TOÀN BỘ để dựng Q và train
 │                          #   "probing input" → prompt
-│                          #   "y_neg" → deprecated API (forget)
-│                          #   "y_pos" → updated API (retain)
-├── D_test_U_dep.json      # 581 mẫu test — kỳ vọng score CAO (deprecated)
-└── D_test_U_nondep.json   # 17179 mẫu test — kỳ vọng score THẤP (bình thường)
+│                          #   "y_neg" → API deprecated (forget)
+│                          #   "y_pos" → API updated   (retain)
+├── D_test_U_dep.json      # 581 mẫu  — kỳ vọng s(x) CAO
+└── D_test_U_nondep.json   # 17179 mẫu — kỳ vọng s(x) THẤP
 ```
+
+Threshold được dò trên **200 mẫu tách ra từ mỗi tập test**, phần còn lại dùng để báo cáo.
+Các prompt trùng với `D_forget.json` bị loại khỏi cả hai (31 ở dep, 194 ở nondep).
 
 ## Chạy Pipeline
 
-Chạy toàn bộ 3 giai đoạn:
-
 ```bash
-bash run_cbd.sh
-```
-
-Hoặc chạy từng giai đoạn:
-
-```bash
-bash run_cbd.sh basis    # ① Trích xuất discriminative subspace
+bash run_cbd.sh basis    # ① Trích xuất discriminative subspace Q
 bash run_cbd.sh train    # ② Train LoRA + gradient projection
-bash run_cbd.sh infer    # ③ Infer + thống kê score
+bash run_cbd.sh infer    # ③ Chấm symKL + thống kê
 ```
+
+Tham số nằm ở đầu `run_cbd.sh`. Vài biến hay dùng:
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `TRAIN_EPOCHS` | 3 | ~2417 bước mỗi epoch |
+| `TRAIN_GPU` | 0 | ép một GPU; nhiều GPU khiến Trainer bọc DataParallel và lệch lịch train |
+| `TRAIN_SAVE_TOTAL_LIMIT` | 10 | giữ checkpoint từng epoch để chọn sau |
+| `TEST_NONDEP_N` | -1 | giới hạn tập âm lúc test; đặt 500 để lặp nhanh |
 
 ### Giai đoạn ① — Trích xuất CBD-DFB Basis
 
-Tạo LoRA trên TinyLlama, thu gradient per-sample trên forget/retain, giải bài toán trị riêng tổng quát → tìm top-k discriminative subspace.
+Dựng LoRA trên TinyLlama, thu gradient per-sample trên forget/retain, giải bài toán trị
+riêng tổng quát `F⁻v = λ(F⁺ + μI)v` → lấy top-k hướng phân biệt nhất.
 
-```bash
-python scripts/extract_cbd_dfb_basis.py \
-    --data_path ../Data-Collection/deepseek/D_forget.json \
-    --max_forget 7733 --max_retain 7733 \
-    --top_k 192 --batch_size 4 --max_len 512 \
-    --output_dir artifacts/basis_cbd_dfb/deepseek_seed42
-```
+Gradient được ghi ra memmap trên đĩa (~153 GB cho 9667 mẫu). Giữ hết trong RAM sẽ bị
+OOM killer; script tự kiểm tra dung lượng trống trước khi chạy.
 
-**Output:** `artifacts/basis_cbd_dfb/deepseek_seed42/cbd_dfb_basis_deepseek_forget_vs_deepseek_retain.pkl`
+**Output:** `artifacts/basis_cbd_dfb/deepseek_seed42/cbd_dfb_basis_*.pkl` + `basis_config.json`
 
 ### Giai đoạn ② — Train Unlearn Model
 
-Dùng Hydra config để train LoRA với CBDDFBForgetTrainer — mỗi bước backward, gradient được project lên subspace Q: `g ← QQ^T g`.
-
-```bash
-python scripts/hf_forget_train.py \
-    --config-name cbd_dfb_deepseek \
-    enable_cbd_dfb=true \
-    cbd_dfb_basis_path=artifacts/basis_cbd_dfb/deepseek_seed42/cbd_dfb_basis_deepseek_forget_vs_deepseek_retain.pkl \
-    seed=42
-```
+LoRA (`r=32`, chỉ `up_proj`, `lora_A` đóng băng) với loss `GradDescent(y_neg) + β·KL(y_pos)`.
+Mỗi bước backward, gradient được chiếu lên Q: `g ← QQᵀg`.
 
 **Output:** LoRA checkpoint trong `artifacts/outputs_trained_models/cbd_dfb_deepseek/`
 
+Các công tắc trong `configs/cbd_dfb_deepseek.yaml`:
+
+| Cờ | Tác dụng |
+|---|---|
+| `cbd_dfb_project_forget_only` | chỉ chiếu nhánh forget: `g = QQᵀg⁻ + β·g⁺` |
+| `cbd_dfb_eigval_weight` | nhân hệ số theo `√λ` |
+| `cbd_dfb_trust_region` | co bước đi khi ảnh hưởng lên retain vượt ε |
+
 ### Giai đoạn ③ — Infer + Thống kê
 
-Tính `score = CE_finetuned - CE_original` trên valid set → tìm threshold, sau đó test trên 2 tập test.
-
-```bash
-python scripts/infer_deepseek.py \
-    --original_model_path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-    --finetuned_model_path artifacts/outputs_trained_models/cbd_dfb_deepseek/<checkpoint> \
-    --valid_data_path ../Data-Collection/deepseek/D_forget.json \
-    --test_dep_path ../Data-Collection/deepseek/D_test_U_dep.json \
-    --test_nondep_path ../Data-Collection/deepseek/D_test_U_nondep.json \
-    --output_dir artifacts/eval_outputs/deepseek
-```
-
-**Output:** Bảng thống kê score + histogram
+**Output:** `artifacts/eval_outputs/deepseek/routing_statistics.json` + `routing_histogram.png`
 
 ## Cấu Trúc Dự Án
 
 ```
 CBD_softweight/
-├── run_cbd.sh                         # 🚀 Script chạy pipeline
+├── run_cbd.sh                         # 🚀 Điều phối ba giai đoạn
 ├── environment.yaml                   # Conda environment
 │
-├── configs/                           # ⚙️ Hydra configs (dùng bởi giai đoạn ②)
-│   ├── cbd_dfb_deepseek.yaml          #   Config chính, merge 5 sub-configs
-│   ├── data/deepseek.yaml             #   Dataset class, path, conv_template
+├── configs/                           # ⚙️ Hydra configs
+│   ├── cbd_dfb_deepseek.yaml          #   Config chính (cũng là config mặc định)
+│   ├── data/deepseek.yaml             #   Đường dẫn + conv_template
 │   ├── data_mode/forget_retain.yaml   #   with_retain, retain_num
-│   ├── model/tinyllama.yaml           #   Model path, tokenizer path
+│   ├── model/tinyllama.yaml           #   Model path, attn_implementation
 │   ├── model_mode/base_freeze_a.yaml  #   LoRA rank, alpha, target modules
-│   └── unlearn_loss/gd+kl.yaml       #   Loss = GradDescent(forget) + KL(retain)
+│   └── unlearn_loss/gd+kl.yaml        #   GradDescent(forget) + KL(retain)
 │
-├── scripts/                           # 🔧 Scripts chạy trực tiếp
-│   ├── extract_cbd_dfb_basis.py       #   Giai đoạn ①: trích xuất basis
-│   ├── hf_forget_train.py             #   Giai đoạn ②: train (Hydra entry point)
-│   └── infer_deepseek.py              #   Giai đoạn ③: infer + thống kê
+├── scripts/
+│   ├── extract_cbd_dfb_basis.py       #   Giai đoạn ①
+│   ├── hf_forget_train.py             #   Giai đoạn ② (Hydra entry point)
+│   ├── infer_deepseek.py              #   Giai đoạn ③
+│   └── routing_score_reducers.py      #   Gộp symKL trên nhiều vị trí token
 │
-├── uld/                               # 📦 Core engine (import bởi scripts)
-│   ├── data/
-│   │   ├── deepseek.py                #   DeepSeek_DataModule
-│   │   ├── datamodule.py              #   TorchDataset, TrainDataModule
-│   │   └── conv_util.py               #   ConvTemplate
-│   ├── model/
-│   │   ├── __init__.py                #   Model factory (TRAIN/EVAL_INIT_FUNCS)
-│   │   ├── utils.py                   #   create_full_model(), create_peft_model()
-│   │   ├── forget_losses.py           #   GradDescentLoss, KLLoss, NPOLoss, ...
-│   │   └── peft_util.py               #   LoRA utilities
-│   └── hfutil/
-│       ├── hf_trainers.py             #   ForgetTrainer (base)
-│       ├── cbd_dfb_trainer.py         #   CBDDFBForgetTrainer (gradient projection)
-│       ├── gmp_trainer.py             #   GPMForgetTrainer
-│       └── hf_callbacks.py            #   SimpleProfileCallback
-│
-└── ../Data-Collection/deepseek/   # 📊 Dữ liệu
-    ├── D_forget.json
-    ├── D_test_U_dep.json
-    └── D_test_U_nondep.json
+└── uld/                               # 📦 Core engine
+    ├── data/
+    │   ├── deepseek.py                #   DeepSeek_DataModule
+    │   ├── datamodule.py              #   TorchDataset, EqualForgetRetainSampler
+    │   └── conv_util.py               #   ConvTemplate
+    ├── model/
+    │   ├── __init__.py                #   TRAIN_INIT_FUNCS
+    │   ├── utils.py                   #   create_full_model()
+    │   ├── forget_losses.py           #   GradDescent, KL, NPO, DPO, ...
+    │   └── peft_util.py               #   LoRA utilities
+    └── hfutil/
+        ├── hf_trainers.py             #   ForgetTrainer (base)
+        ├── cbd_dfb_trainer.py         #   CBDDFBForgetTrainer (gradient projection)
+        └── hf_callbacks.py            #   SimpleProfileCallback
 ```
+
+## Ràng buộc giữa các giai đoạn
+
+Ba thứ này **phải khớp** giữa ① và ②, nếu không Q sẽ nằm ở không gian khác với gradient
+lúc train và phép chiếu trở nên vô nghĩa — mà không có lỗi nào được ném ra:
+
+1. **LoRA config** — `r=32`, `alpha=64`, `dropout=0.05`, target `up_proj`, `lora_A` đóng băng
+2. **conv_template** — ba token phân cách đều rỗng, `max_len=512`
+3. **`train_ratio`** — `1.0` ở cả hai
+
+Kiểm tra (1) bằng cách so hash trọng số `lora_A` dựng theo hai đường; (2) và (3) đọc trực
+tiếp trong `configs/data/deepseek.yaml` so với `scripts/extract_cbd_dfb_basis.py:main()`.
 
 ## Artifacts (git-ignored)
 

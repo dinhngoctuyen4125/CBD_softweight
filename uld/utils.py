@@ -5,7 +5,6 @@ import structlog
 from codetiming import Timer
 from omegaconf import OmegaConf, DictConfig, ListConfig
 from hydra.core.hydra_config import HydraConfig
-from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, TimeElapsedColumn
 from pytorch_lightning import seed_everything
 
 from .log_util import configure_structlog
@@ -57,15 +56,6 @@ def find_unfilled_paths(conf, path=None):
         
     return paths_with_unfilled
 
-def set_progress(disable=False):
-    return Progress(
-        TextColumn("[bold blue]{task.fields[name]}", justify="left"),
-        BarColumn(bar_width=None),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        "[progress.percentage]{task.percentage:>3.0f}%",
-        disable=disable,
-    ) 
 
 def create_log_dir(configs):
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
