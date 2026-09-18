@@ -463,6 +463,10 @@ def main() -> None:
     parser.add_argument("--calib_nondep_n", type=int, default=200,
                         help="Records of D_test_U_nondep used to pick the threshold. Raising this "
                              "without --optimize gap skews the threshold toward the majority class")
+    parser.add_argument("--test_nondep_n", type=int, default=-1,
+                        help="Cap the negative TEST set (-1 = all ~16700). 500 is plenty while "
+                             "iterating, but widens the FPR confidence interval ~7x, so report "
+                             "the final number on the full set")
     parser.add_argument("--exclude_train_overlap", dest="exclude_train_overlap", action="store_true",
                         default=True,
                         help="Drop test prompts that also appear in D_forget (31 in dep, 194 in nondep)")
@@ -535,6 +539,17 @@ def main() -> None:
 
     calib_dep, test_dep_prompts = split_calib_test(dep_prompts_all, args.calib_dep_n, args.seed)
     calib_nondep, test_nondep_prompts = split_calib_test(nondep_prompts_all, args.calib_nondep_n, args.seed)
+
+    # Subsample AFTER the calibration split, so the threshold is unaffected and shrinking the
+    # test set never changes which prompts were used to pick it.
+    n_cap = int(args.test_nondep_n)
+    if n_cap > 0 and len(test_nondep_prompts) > n_cap:
+        full_n = len(test_nondep_prompts)
+        order = list(range(full_n))
+        random.Random(args.seed + 1).shuffle(order)
+        test_nondep_prompts = [test_nondep_prompts[i] for i in sorted(order[:n_cap])]
+        print(f"  subsampled test nondep: {full_n} -> {len(test_nondep_prompts)} "
+              f"(FPR resolution {100.0 / len(test_nondep_prompts):.2f}%)")
 
     print(f"  calibration: dep={len(calib_dep)} nondep={len(calib_nondep)}")
     print(f"  test:        dep={len(test_dep_prompts)} nondep={len(test_nondep_prompts)}")
@@ -618,6 +633,7 @@ def main() -> None:
             "calib_nondep_n": len(calib_nondep),
             "test_dep_n": len(test_dep_prompts),
             "test_nondep_n": len(test_nondep_prompts),
+            "test_nondep_capped": bool(n_cap > 0),
             "exclude_train_overlap": bool(args.exclude_train_overlap),
             "truncate_mode": args.truncate_mode,
             "score_last_k": max(1, int(args.score_last_k)),

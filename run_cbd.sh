@@ -50,6 +50,9 @@ INFER_BATCH_SIZE=8
 PROMPT_FIELD="probing input"
 CALIB_DEP_N=200
 CALIB_NONDEP_N=200
+# Giới hạn tập âm lúc TEST. 500 đủ để lặp nhanh; đặt -1 (toàn bộ ~16.700) khi lấy số cuối,
+# vì khoảng tin cậy của FPR hẹp hơn khoảng 7 lần.
+TEST_NONDEP_N="${TEST_NONDEP_N:--1}"
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Thêm đường dẫn hiện tại vào PYTHONPATH để import được uld
@@ -175,6 +178,7 @@ run_infer() {
         --prompt_field "${PROMPT_FIELD}" \
         --calib_dep_n ${CALIB_DEP_N} \
         --calib_nondep_n ${CALIB_NONDEP_N} \
+        --test_nondep_n ${TEST_NONDEP_N} \
         --batch_size ${INFER_BATCH_SIZE} \
         --max_len ${MAX_LEN} \
         --seed ${SEED}
