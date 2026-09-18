@@ -12,6 +12,7 @@ import json
 import argparse
 import pickle
 import random
+import shutil
 import time
 import math
 import numpy as np
@@ -121,6 +122,49 @@ def _compute_per_sample_loss(logits, labels):
     return loss_per_sample
 
 
+# numpy has no bfloat16, so that option is widened to float32 on disk.
+_DISK_DTYPE = {"float16": np.float16, "bfloat16": np.float32, "float32": np.float32}
+
+
+class _GradStore:
+    """Per-layer per-sample gradient matrix [n, d], backed by an on-disk memmap.
+
+    Holding every gradient in RAM costs n * d * 22 layers * 2 bytes -- 57 GiB per split
+    at n=7733, d=180224 -- and that is anonymous heap, which the kernel cannot reclaim,
+    so the process gets OOM-killed. Memmap pages are ordinary page cache: they can be
+    evicted under pressure and faulted back in on demand, so resident memory stays flat.
+    """
+
+    __slots__ = ("path", "dim", "n", "_mm")
+
+    def __init__(self, path, capacity, dim, np_dtype):
+        self.path = path
+        self.dim = int(dim)
+        self.n = 0
+        self._mm = np.memmap(path, dtype=np_dtype, mode="w+", shape=(int(capacity), self.dim))
+
+    def append(self, block):
+        b = int(block.shape[0])
+        self._mm[self.n:self.n + b] = block.numpy()
+        self.n += b
+
+    def rows(self):
+        return self._mm[:self.n]
+
+    def close(self):
+        try:
+            self._mm.flush()
+        except Exception:
+            pass
+        self._mm = None
+
+
+def close_grad_stores(grads):
+    for store in (grads or {}).values():
+        if isinstance(store, _GradStore):
+            store.close()
+
+
 def collect_gradients(
     model,
     tokenizer,
@@ -130,18 +174,30 @@ def collect_gradients(
     max_len,
     batch_size=1,
     store_dtype="float16",
+    cache_dir=None,
+    tag="split",
 ):
     grads = {}
     target_params = []
     for name, param in model.named_parameters():
         if "lora_B" in name and "up_proj" in name and "default" in name:
             target_params.append((name, param))
+
+    total = min(len(dataset), max_samples)
+    if cache_dir is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+        np_dtype = _DISK_DTYPE[store_dtype]
+        for idx, (name, param) in enumerate(target_params):
+            safe = name.replace(".", "_").replace("/", "_")
+            path = os.path.join(cache_dir, f"{tag}.{idx:03d}.{safe}.grad")
+            grads[name] = _GradStore(path, total, param.numel(), np_dtype)
+    else:
+        for name, _ in target_params:
             grads[name] = []
 
     device = next(model.parameters()).device
     model.eval()
 
-    total = min(len(dataset), max_samples)
     t0 = time.perf_counter()
     kept = 0
     batch_size = max(int(batch_size), 1)
@@ -191,9 +247,10 @@ def collect_gradients(
             g = g.detach()
             if store_dtype == "float16":
                 g = g.to(torch.float16)
-            elif store_dtype == "bfloat16":
+            elif store_dtype == "bfloat16" and cache_dir is None:
                 g = g.to(torch.bfloat16)
             else:
+                # numpy cannot hold bfloat16; widen so the memmap path stays lossless.
                 g = g.to(torch.float32)
             grads[name].append(g.reshape(b, -1).cpu())
 
@@ -227,6 +284,32 @@ def _concat_grad_chunks(chunks):
     raise ValueError(f"Unsupported gradient chunk type: {type(first)}")
 
 
+def _load_layer_matrix(source, device, chunk_rows=256):
+    """Return one layer's gradients as [d, n] float32 on `device`.
+
+    Built column-block by column-block so we never hold an [n, d] copy and its [d, n]
+    transpose at the same time; each of those is 5.6 GB at n=7733, d=180224.
+    """
+    if source is None:
+        return None
+    if isinstance(source, _GradStore):
+        n, d = source.n, source.dim
+        if n == 0:
+            return None
+        rows = source.rows()
+        out = torch.empty((d, n), device=device, dtype=torch.float32)
+        for i in range(0, n, chunk_rows):
+            block = torch.from_numpy(np.ascontiguousarray(rows[i:i + chunk_rows]))
+            block = block.to(device=device, dtype=torch.float32)
+            out[:, i:i + block.shape[0]] = block.t()
+            del block
+        return out
+    mat = _concat_grad_chunks(source)
+    if mat is None:
+        return None
+    return mat.to(device=device, dtype=torch.float32).t().contiguous()
+
+
 def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, target_variance, top_k):
     basis = {}
     compute_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -254,17 +337,17 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
 
     for layer_name in forget_grads:
         layer_t0 = time.perf_counter()
-        f_mat = _concat_grad_chunks(forget_grads[layer_name])  # [n_f, d]
-        r_mat = _concat_grad_chunks(retain_grads.get(layer_name, []))  # [n_r, d]
-        if f_mat is None or r_mat is None:
-            continue
-
         # Build G_f and G_r from per-sample flattened gradients.
         # Each sample gradient is a vector in R^d where d = out_dim * r (LoRA-B).
+        # Only ONE layer is resident at a time: with disk-backed stores this bounds memory
+        # at O(one layer) instead of O(all layers), which is what makes the full run fit.
         # We move the heavy linear algebra to GPU when available, otherwise limit CPU threads.
         # Keep compute in float32 for stable eigh/qr.
-        G_f = f_mat.to(device=compute_device, dtype=torch.float32).t().contiguous()  # [d, n_f]
-        G_r = r_mat.to(device=compute_device, dtype=torch.float32).t().contiguous()  # [d, n_r]
+        G_f = _load_layer_matrix(forget_grads.get(layer_name), compute_device)  # [d, n_f]
+        G_r = _load_layer_matrix(retain_grads.get(layer_name), compute_device)  # [d, n_r]
+        if G_f is None or G_r is None:
+            G_f = G_r = None
+            continue
 
         n_f = G_f.size(1)
         n_r = G_r.size(1)
@@ -284,27 +367,34 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
         # Compute small matrices
         K_r = G_r.t().matmul(G_r)  # [n_r, n_r]
         K_rf = G_r.t().matmul(G_f)  # [n_r, n_f]
+        K_f = G_f.t().matmul(G_f)  # [n_f, n_f]
         eye_r = torch.eye(n_r, dtype=K_r.dtype, device=compute_device)
 
+        # Z = (F_r + mu*I)^-1 G_f is [d, n_f] -- 5.6 GB at d=180224, n_f=7733. We never
+        # materialize it, because both places it appears collapse onto the small n x n
+        # matrices we already have (X = (K_r + n_r*mu*I)^-1 K_rf):
+        #     M = G_f^T Z / n_f = (K_f - K_rf^T X) / (mu * n_f)
+        #     Q = Z u           = (G_f u - G_r (X u)) / mu     with u only k columns wide
+        # Algebraically identical to the explicit form, one 5.6 GB buffer cheaper.
+        #
         # Numerical guard: for some large/ill-conditioned layers, low mu can produce
-        # non-finite Z/M while solve itself succeeds. We only escalate mu on failure.
+        # non-finite X/M while solve itself succeeds. We only escalate mu on failure.
         M = None
-        Z = None
+        X = None
         mu_eff = mu_layer
         for _attempt in range(8):
             try:
                 A = K_r + (n_r * mu_eff) * eye_r  # [n_r, n_r], SPD
                 try:
                     L = torch.linalg.cholesky(A)
-                    X = torch.cholesky_solve(K_rf, L)  # [n_r, n_f]
+                    X_try = torch.cholesky_solve(K_rf, L)  # [n_r, n_f]
                 except RuntimeError:
                     # Fallback to generic solver if Cholesky fails.
-                    X = torch.linalg.solve(A, K_rf)
+                    X_try = torch.linalg.solve(A, K_rf)
 
-                Z_try = (1.0 / mu_eff) * (G_f - G_r.matmul(X))
-                M_try = (G_f.t().matmul(Z_try)) / float(n_f)
-                if torch.isfinite(Z_try).all() and torch.isfinite(M_try).all():
-                    Z = Z_try
+                M_try = (K_f - K_rf.t().matmul(X_try)) / (mu_eff * float(n_f))
+                if torch.isfinite(X_try).all() and torch.isfinite(M_try).all():
+                    X = X_try
                     M = M_try
                     mu_layer = mu_eff
                     break
@@ -312,13 +402,13 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
                 pass
             mu_eff *= 10.0
 
-        if M is None or Z is None:
+        if M is None or X is None:
             # CPU-float64 fallback for pathological layers; only active on numerical failure.
-            G_f_cpu = G_f.detach().to(device="cpu", dtype=torch.float64)
-            G_r_cpu = G_r.detach().to(device="cpu", dtype=torch.float64)
-            K_r_cpu = G_r_cpu.t().matmul(G_r_cpu)
-            K_rf_cpu = G_r_cpu.t().matmul(G_f_cpu)
-            eye_r_cpu = torch.eye(n_r, dtype=K_r_cpu.dtype, device="cpu")
+            # Only the n x n matrices are promoted to float64, so this stays affordable.
+            K_r_cpu = K_r.detach().to(device="cpu", dtype=torch.float64)
+            K_rf_cpu = K_rf.detach().to(device="cpu", dtype=torch.float64)
+            K_f_cpu = K_f.detach().to(device="cpu", dtype=torch.float64)
+            eye_r_cpu = torch.eye(n_r, dtype=torch.float64, device="cpu")
             mu_eff_cpu = max(mu_layer, 1e-8)
             ok_cpu = False
             for _attempt in range(10):
@@ -329,10 +419,9 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
                         X_cpu = torch.cholesky_solve(K_rf_cpu, L_cpu)
                     except RuntimeError:
                         X_cpu = torch.linalg.solve(A_cpu, K_rf_cpu)
-                    Z_cpu = (1.0 / mu_eff_cpu) * (G_f_cpu - G_r_cpu.matmul(X_cpu))
-                    M_cpu = (G_f_cpu.t().matmul(Z_cpu)) / float(n_f)
-                    if torch.isfinite(Z_cpu).all() and torch.isfinite(M_cpu).all():
-                        Z = Z_cpu.to(device=compute_device, dtype=torch.float32)
+                    M_cpu = (K_f_cpu - K_rf_cpu.t().matmul(X_cpu)) / (mu_eff_cpu * float(n_f))
+                    if torch.isfinite(X_cpu).all() and torch.isfinite(M_cpu).all():
+                        X = X_cpu.to(device=compute_device, dtype=torch.float32)
                         M = M_cpu.to(device=compute_device, dtype=torch.float32)
                         mu_layer = float(mu_eff_cpu)
                         ok_cpu = True
@@ -342,7 +431,7 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
                 mu_eff_cpu *= 10.0
             if not ok_cpu:
                 print(f"[compute_cbd_dfb_basis] WARN skip_layer_nonfinite layer={layer_name}")
-                del G_f, G_r, K_r, K_rf, eye_r
+                G_f = G_r = K_r = K_rf = K_f = eye_r = A = L = X = M = None
                 if compute_device.type == "cuda":
                     torch.cuda.empty_cache()
                 continue
@@ -426,7 +515,7 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
                         U_np, S_np, _ = np.linalg.svd(M_np, full_matrices=False)
                         if (not np.isfinite(S_np).all()) or (not np.isfinite(U_np).all()):
                             print(f"[compute_cbd_dfb_basis] WARN skip_layer_nonfinite_svd layer={layer_name}")
-                            del G_f, G_r, K_r, K_rf, eye_r, Z, M, M_sym, eye_m
+                            G_f = G_r = K_r = K_rf = K_f = eye_r = X = M = M_sym = eye_m = None
                             if compute_device.type == "cuda":
                                 torch.cuda.empty_cache()
                             continue
@@ -452,7 +541,8 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
                     k = 1
         u = eigvecs[:, :k]
         eigvals_k = eigvals[:k].clamp(min=0)
-        Q = Z.matmul(u)  # [out_dim, k]
+        # Q = Z u, expanded so Z is never formed. X.matmul(u) is [n_r, k] -- negligible.
+        Q = (G_f.matmul(u) - G_r.matmul(X.matmul(u))) / mu_layer  # [out_dim, k]
 
         # Orthonormalize Q
         Q, _ = torch.linalg.qr(Q)
@@ -464,7 +554,8 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
 
         if (not torch.isfinite(Q_T).all()) or (not torch.isfinite(eigvals_k).all()) or (not torch.isfinite(retain_proj).all()):
             print(f"[compute_cbd_dfb_basis] WARN skip_layer_nonfinite_outputs layer={layer_name}")
-            del G_f, G_r, K_r, K_rf, eye_r, Z, M, M_sym, eye_m, eigvals, eigvecs, u, Q, Q_T, retain_proj
+            G_f = G_r = K_r = K_rf = K_f = eye_r = X = M = M_sym = eye_m = None
+            eigvals = eigvecs = u = Q = Q_T = retain_proj = None
             if compute_device.type == "cuda":
                 torch.cuda.empty_cache()
             continue
@@ -484,8 +575,10 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
         layer_dt = time.perf_counter() - layer_t0
         print(f"[compute_cbd_dfb_basis] layer={layer_name} k={basis[layer_name]['n_components']} sec={layer_dt:.2f}")
 
-        # Free per-layer tensors early to keep memory bounded.
-        del G_f, G_r, K_r, K_rf, eye_r, A, X, Z, M, M_sym, eye_m, eigvals, eigvecs, u, Q, Q_T
+        # Free per-layer tensors early to keep memory bounded. Assignment rather than `del`
+        # because some names stay unbound when a numerical fallback path was taken.
+        G_f = G_r = K_r = K_rf = K_f = eye_r = A = L = X = M = M_sym = eye_m = None
+        eigvals = eigvecs = u = Q = Q_T = retain_proj = None
         if compute_device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -502,7 +595,10 @@ def main():
     parser.add_argument("--max_retain", type=int, default=400)
     parser.add_argument("--max_len", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=1, help="梯度收集 batch size（>1 会用 per-sample autograd 批量提取）")
-    parser.add_argument("--grad_store_dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"], help="CPU 上存储梯度的 dtype（仅影响内存/速度）")
+    parser.add_argument("--grad_store_dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"], help="存储梯度的 dtype（仅影响内存/磁盘/速度）")
+    parser.add_argument("--grad_cache_dir", type=str, default=None, help="梯度 memmap 缓存目录（默认 <output_dir>/grad_cache）")
+    parser.add_argument("--in_memory_grads", action="store_true", help="把全部梯度留在 RAM（旧行为，大样本量会 OOM）")
+    parser.add_argument("--keep_grad_cache", action="store_true", help="结束后保留梯度缓存文件")
     parser.add_argument("--refuse_forget", action="store_true", help="将 forget 的答案替换为固定拒答（需与训练 data_mode 对齐）")
     parser.add_argument("--refuse_answer", type=str, default="I don't know.", help="refuse_forget 时使用的拒答文本")
     parser.add_argument("--mu", type=float, default=1e-3)
@@ -614,6 +710,43 @@ def main():
 
     print(f"Forget samples: {len(forget_ds)}, Retain samples: {len(retain_ds)}")
 
+    # ---- Memory / disk preflight -------------------------------------------------
+    n_layers = sum(
+        1 for n, _ in model.named_parameters()
+        if "lora_B" in n and "up_proj" in n and "default" in n
+    )
+    dim = max(
+        (p.numel() for n, p in model.named_parameters()
+         if "lora_B" in n and "up_proj" in n and "default" in n),
+        default=0,
+    )
+    itemsize = np.dtype(_DISK_DTYPE[args.grad_store_dtype]).itemsize
+    bytes_forget = len(forget_ds) * dim * itemsize * n_layers
+    bytes_retain = len(retain_ds) * dim * itemsize * n_layers
+    need_bytes = bytes_forget + bytes_retain
+    peak_vram = (len(forget_ds) + len(retain_ds)) * dim * 4
+    print(
+        f"[preflight] layers={n_layers} dim={dim} itemsize={itemsize}\n"
+        f"[preflight] gradient bytes: forget={bytes_forget/1e9:.1f} GB "
+        f"retain={bytes_retain/1e9:.1f} GB total={need_bytes/1e9:.1f} GB\n"
+        f"[preflight] peak VRAM for G_f+G_r (float32) ~= {peak_vram/1e9:.1f} GB per layer"
+    )
+
+    cache_dir = None
+    if not args.in_memory_grads:
+        cache_dir = args.grad_cache_dir or os.path.join(args.output_dir, "grad_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        free_bytes = shutil.disk_usage(cache_dir).free
+        print(f"[preflight] grad cache -> {os.path.abspath(cache_dir)} (free {free_bytes/1e9:.1f} GB)")
+        if free_bytes < need_bytes * 1.05:
+            raise RuntimeError(
+                f"Not enough free disk for the gradient cache: need ~{need_bytes/1e9:.1f} GB, "
+                f"have {free_bytes/1e9:.1f} GB at {os.path.abspath(cache_dir)}. "
+                f"Point --grad_cache_dir at a larger volume, or lower --max_forget/--max_retain."
+            )
+    else:
+        print(f"[preflight] WARNING --in_memory_grads: needs ~{need_bytes/1e9:.1f} GB of RAM")
+
     t0 = time.perf_counter()
     forget_grads = collect_gradients(
         model,
@@ -624,6 +757,8 @@ def main():
         args.max_len,
         batch_size=args.batch_size,
         store_dtype=args.grad_store_dtype,
+        cache_dir=cache_dir,
+        tag="forget",
     )
     t_forget = time.perf_counter()
     retain_grads = collect_gradients(
@@ -635,18 +770,29 @@ def main():
         args.max_len,
         batch_size=args.batch_size,
         store_dtype=args.grad_store_dtype,
+        cache_dir=cache_dir,
+        tag="retain",
     )
     t_retain = time.perf_counter()
 
-    basis = compute_cbd_dfb_basis(
-        forget_grads,
-        retain_grads,
-        mu=args.mu,
-        mu_mode=args.mu_mode,
-        mu_scale=args.mu_scale,
-        target_variance=args.target_variance,
-        top_k=args.top_k,
-    )
+    # The model is no longer needed; release its VRAM before the linear algebra.
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    try:
+        basis = compute_cbd_dfb_basis(
+            forget_grads,
+            retain_grads,
+            mu=args.mu,
+            mu_mode=args.mu_mode,
+            mu_scale=args.mu_scale,
+            target_variance=args.target_variance,
+            top_k=args.top_k,
+        )
+    finally:
+        close_grad_stores(forget_grads)
+        close_grad_stores(retain_grads)
     t_basis = time.perf_counter()
     print(f"[timing] forget_grads_sec={t_forget - t0:.1f} retain_grads_sec={t_retain - t_forget:.1f} basis_sec={t_basis - t_retain:.1f} total_sec={t_basis - t0:.1f}")
 
@@ -656,12 +802,10 @@ def main():
 
     config = {
         "base_model_name": args.base_model_name,
-        "dataset": args.dataset,
-        "forget_split": args.forget_split,
-        "retain_split": args.retain_split,
-        "wmdp_domains": args.wmdp_domains,
-        "mmlu_retain_file": args.mmlu_retain_file,
-        "mmlu_retain_subjects": args.mmlu_retain_subjects,
+        "data_path": args.data_path,
+        "train_ratio": args.train_ratio,
+        "seed": args.seed,
+        "max_len": args.max_len,
         "max_forget": args.max_forget,
         "max_retain": args.max_retain,
         "mu": args.mu,
@@ -686,6 +830,10 @@ def main():
         json.dump(config, f, indent=2)
 
     print(f"Saved basis to {basis_path}")
+
+    if cache_dir is not None and not args.keep_grad_cache:
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        print(f"Removed gradient cache {cache_dir}")
 
 
 if __name__ == "__main__":
