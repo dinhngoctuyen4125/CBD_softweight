@@ -69,14 +69,26 @@ class TorchDataset(torch.utils.data.Dataset):
 
         self.dpo_mode = dpo_mode
         self.mcq_last_token_only = bool(mcq_last_token_only)
+        # Only DPO mode draws from the refusal pool. Loading it unconditionally made every
+        # dataset depend on a file this repo does not ship, so non-DPO runs crashed here.
+        self.alternative_responses = self._load_refusals() if self.dpo_mode else []
+        cache_env = os.getenv("TOKENIZE_RESULT_CACHE", "1").strip().lower()
+        self.enable_cache = (not self.dpo_mode) and cache_env not in {"0", "false", "no", "off"}
+        self._item_cache = [None] * len(self.data) if self.enable_cache else None
+
+    @staticmethod
+    def _load_refusals():
         refusal_path = os.getenv("REFUSAL_DATA_PATH")
         if not refusal_path:
             data_root = os.getenv("CBD_DATA_ROOT", "data")
             refusal_path = os.path.join(data_root, "data", "refusal.jsonl")
-        self.alternative_responses = [json.loads(x) for x in open(refusal_path).readlines()]
-        cache_env = os.getenv("TOKENIZE_RESULT_CACHE", "1").strip().lower()
-        self.enable_cache = (not self.dpo_mode) and cache_env not in {"0", "false", "no", "off"}
-        self._item_cache = [None] * len(self.data) if self.enable_cache else None
+        if not os.path.exists(refusal_path):
+            raise FileNotFoundError(
+                f"DPO mode needs a refusal pool but {refusal_path} does not exist. "
+                f"Set REFUSAL_DATA_PATH or CBD_DATA_ROOT."
+            )
+        with open(refusal_path, "r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
 
     def __len__(self):
         return len(self.data)

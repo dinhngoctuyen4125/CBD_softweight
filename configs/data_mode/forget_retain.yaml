@@ -4,7 +4,9 @@ expand_forget: False
 expand_qanum: 0
 expand_data_path: null
 with_retain: True
-retain_num: 400 #! adaptive to be equal to forget data
+#! -1 = dùng hết. Với DeepSeek, retain phải bằng forget (9667) để khớp basis Q;
+#! để 400 sẽ khiến retain chỉ có 400 mẫu mà không báo lỗi gì.
+retain_num: -1
 retain_match_forget: False
 with_perturb: False
 with_dpo: False
