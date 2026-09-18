@@ -422,13 +422,20 @@ def extract_prompts(
     return out
 
 
-def describe(name: str, scores: np.ndarray, threshold: float) -> Dict:
-    above = int(np.sum(scores > threshold))
+def describe(name: str, scores: np.ndarray, threshold: float, expect: str = "above") -> Dict:
+    """Print one score distribution and return its counts on both sides of the threshold.
+
+    `expect` records which side counts as correct for this dataset: deprecated prompts
+    should land ABOVE the threshold, non-deprecated ones at or BELOW it.
+    """
     total = int(scores.size)
-    pct = 100.0 * above / total if total else 0.0
+    above = int(np.sum(scores > threshold))
+    below = total - above
+    correct = above if expect == "above" else below
+    pct = 100.0 * correct / total if total else 0.0
     print(
         f"  {name:24s} | {scores.mean():9.5f} | {scores.std():9.5f} | "
-        f"{scores.min():9.5f} | {scores.max():9.5f} | {above:6d}/{total:6d} ({pct:5.1f}%)"
+        f"{scores.min():9.5f} | {scores.max():9.5f} | {above:6d} | {below:6d}"
     )
     return {
         "n": total,
@@ -437,7 +444,10 @@ def describe(name: str, scores: np.ndarray, threshold: float) -> Dict:
         "min": float(scores.min()) if total else 0.0,
         "max": float(scores.max()) if total else 0.0,
         "above_threshold": above,
-        "above_threshold_pct": float(pct),
+        "below_or_equal_threshold": below,
+        "expect": expect,
+        "correct": correct,
+        "correct_pct": float(pct),
     }
 
 
@@ -604,17 +614,25 @@ def main() -> None:
     print(f"  TEST : acc={test_metrics['accuracy']*100:.2f}%  tpr={test_metrics['tpr']*100:.2f}%  "
           f"fpr={test_metrics['fpr']*100:.2f}%  f1={test_metrics['f1']:.4f}")
     print("-" * 90)
-    print(f"  {'dataset':24s} | {'mean':>9s} | {'std':>9s} | {'min':>9s} | {'max':>9s} | {'> thresh':>16s}")
+    print(f"  {'dataset':24s} | {'mean':>9s} | {'std':>9s} | {'min':>9s} | {'max':>9s} | "
+          f"{'> thr':>6s} | {'<= thr':>6s}")
     print("-" * 90)
     stats = {
-        "calib_dep": describe("calib dep (deprecated)", calib_dep_scores, threshold),
-        "calib_nondep": describe("calib nondep", calib_nondep_scores, threshold),
-        "test_dep": describe("D_test_U_dep (test)", dep_scores, threshold),
-        "test_nondep": describe("D_test_U_nondep (test)", nondep_scores, threshold),
+        "calib_dep": describe("calib dep (deprecated)", calib_dep_scores, threshold, "above"),
+        "calib_nondep": describe("calib nondep", calib_nondep_scores, threshold, "below"),
+        "test_dep": describe("D_test_U_dep (test)", dep_scores, threshold, "above"),
+        "test_nondep": describe("D_test_U_nondep (test)", nondep_scores, threshold, "below"),
     }
     print("=" * 90)
+    print(f"  CLASSIFIED CORRECTLY   (threshold = {threshold:.6f})")
+    td, tn = stats["test_dep"], stats["test_nondep"]
+    print(f"    D_test_U_dep      score >  threshold : {td['correct']:6d} / {td['n']:<6d} "
+          f"({td['correct_pct']:5.2f}%)")
+    print(f"    D_test_U_nondep   score <= threshold : {tn['correct']:6d} / {tn['n']:<6d} "
+          f"({tn['correct_pct']:5.2f}%)")
+    print("=" * 90)
     print("  NOTE: ~5.8% of D_test_U_nondep still continues with a deprecated API name,")
-    print("        so a perfect detector would still show roughly that much FPR.")
+    print("        so a perfect detector would still miss roughly that many of them.")
 
     results = {
         "score": "symmetric_kl",
