@@ -1,0 +1,25 @@
+dataset:
+  class_name: DeepSeek
+  name: deepseek
+  data_path: ../Data-Collection/deepseek/D_forget.json
+
+  # Toàn bộ D_forget dùng để train; threshold được dò trên 200 mẫu tách ra từ
+  # D_test_U_dep / D_test_U_nondep ở giai đoạn ③.
+  train_ratio: 1.0
+  # Chỉ có tác dụng khi train_ratio < 1.0. Phải khớp --seed của giai đoạn ①.
+  split_seed: 42
+
+  # -1 = dùng hết. Giữ hai bên bằng nhau để y_neg/y_pos còn ghép cặp theo từng bản ghi.
+  max_forget: -1
+
+  max_len: 512
+  batch_size: 4
+
+conv_template:
+  # PHẢI khớp chính xác conv_template_cfg hard-code trong
+  # scripts/extract_cbd_dfb_basis.py:main(), nếu không basis Q và gradient lúc
+  # train sẽ được tính trên hai chuỗi prompt khác nhau.
+  question_start_token: ""
+  question_end_token: ""
+  answer_token: ""
+  max_len: 512
