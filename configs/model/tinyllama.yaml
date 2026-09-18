@@ -1,4 +1,9 @@
 model_name: tinyllama
 model_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 tokenizer_path: TinyLlama/TinyLlama-1.1B-Chat-v1.0
-attn_implementation: eager  # align with CBD-CKPT for fair comparison
+# sdpa thay cho eager: nhanh hơn rõ rệt ở seq_len 512, và khớp hơn với giai đoạn ①
+# (build_lora_model() không truyền attn_implementation, nên transformers 4.38.1 tự chọn
+# sdpa cho Llama khi torch >= 2.1 — tức Q đã được dựng dưới sdpa).
+# Đổi lại khi cần so trực tiếp với baseline CBD-CKPT:
+#   python scripts/hf_forget_train.py ... model.attn_implementation=eager
+attn_implementation: sdpa
