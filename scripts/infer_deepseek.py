@@ -11,13 +11,14 @@ next-token position after the prompt**, not a cross-entropy difference.
 
   A0 = original assistant, A1 = unlearned assistant.
 
-Only the data plumbing is DeepSeek-specific:
+Only the data plumbing is DeepSeek-specific. D_forget is consumed entirely by basis
+extraction and training, so both the threshold and the reported metrics come from the two
+test corpora, split disjointly -- mirroring the author's validation-vs-test separation:
 
-  * prompt            -> `probing input` (code that calls a deprecated API)
-  * forget side       -> `probing input`   from the valid split of D_forget.json
-  * retain side       -> `retain`          from the same records
-  * test positive     -> D_test_U_dep.json      (expect score ABOVE threshold)
-  * test negative     -> D_test_U_nondep.json   (expect score BELOW threshold)
+  * prompt        -> `probing input`, stripped to match the training-time ConvTemplate
+  * calibration   -> 200 of D_test_U_dep (positive) + 200 of D_test_U_nondep (negative)
+  * test          -> everything left in each corpus, disjoint from the above
+  * prompts that also occur in D_forget are dropped, since training has seen them
 
 The author's MCQ-only options (`score_space=choices/choices5`,
 `score_pos=after_choice_prefix`) are not ported: they index the A/B/C/D answer
@@ -366,23 +367,50 @@ def load_json(path):
         return json.load(f)
 
 
-def valid_split(raw_data: List[Dict], train_ratio: float, seed: int) -> List[Dict]:
-    """Reproduce the split used by extract_cbd_dfb_basis.py -- must stay byte-identical."""
-    n_total = len(raw_data)
-    n_train = int(n_total * train_ratio)
-    indices = list(range(n_total))
-    rng = random.Random(seed)
-    rng.shuffle(indices)
-    valid_indices = sorted(indices[n_train:])
-    return [raw_data[i] for i in valid_indices]
+def dedupe(prompts: List[str]) -> List[str]:
+    """Order-preserving dedupe.
+
+    Both test corpora repeat prompt strings (nondep: 17179 records, 17119 distinct). Splitting
+    by index would then put the same prompt in both calibration and test, leaking the threshold
+    into the reported metrics.
+    """
+    seen = set()
+    out = []
+    for p in prompts:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
 
 
-def extract_prompts(records: List[Dict], field: str, fallback: str = "probing input") -> List[str]:
+def split_calib_test(prompts: List[str], n_calib: int, seed: int) -> Tuple[List[str], List[str]]:
+    """Disjoint calibration / test split, mirroring the author's validation-vs-test separation
+    (select_wmdp_routing_threshold.py reads mmlu/all_validation.jsonl, eval_wmdp_routing.py
+    reads mmlu/all_test.jsonl)."""
+    idx = list(range(len(prompts)))
+    random.Random(seed).shuffle(idx)
+    n_calib = max(0, min(int(n_calib), len(idx)))
+    calib = [prompts[i] for i in sorted(idx[:n_calib])]
+    test = [prompts[i] for i in sorted(idx[n_calib:])]
+    return calib, test
+
+
+def extract_prompts(
+    records: List[Dict],
+    field: str,
+    fallback: str = "probing input",
+    strip: bool = True,
+) -> List[str]:
     """Pull the prompt text out of each record.
 
-    IMPORTANT: no .strip() here. `probing input new` is cut at the API decision point and
-    1535/9667 records end in indentation whitespace that is part of the anchor context --
-    stripping it would move the scored position.
+    `strip` must reproduce whatever the training-time ConvTemplate did, because the routing
+    score reads the model's distribution at the LAST prompt token -- if the two disagree, the
+    scored position is not the position training pushed on.
+
+      * `probing input`     -> ConvTemplate.prepare_gen_prompt() calls question.strip(), and
+                               9665/9667 records end in a newline, so we must strip too.
+      * `probing input new` -> never used in training; its trailing indentation is part of the
+                               anchor (1535/9667 records), so it is kept verbatim.
     """
     out: List[str] = []
     for it in records:
@@ -390,7 +418,7 @@ def extract_prompts(records: List[Dict], field: str, fallback: str = "probing in
         if not isinstance(v, str) or not v.strip():
             v = it.get(fallback)
         if isinstance(v, str) and v.strip():
-            out.append(v)
+            out.append(v.strip() if strip else v)
     return out
 
 
@@ -425,23 +453,27 @@ def main() -> None:
     parser.add_argument("--output_dir", type=str, default="artifacts/eval_outputs/deepseek")
     parser.add_argument("--max_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--train_ratio", type=float, default=0.8,
-                        help="Must match the ratio used at basis extraction / training time")
     parser.add_argument("--seed", type=int, default=42)
+
+    # Calibration / test split. D_test_U_dep holds only 581 records, so the positive
+    # calibration slice has to stay small; keeping it balanced against the negative slice
+    # matters because --optimize accuracy follows whichever class is larger.
+    parser.add_argument("--calib_dep_n", type=int, default=200,
+                        help="Records of D_test_U_dep used to pick the threshold (max 581)")
+    parser.add_argument("--calib_nondep_n", type=int, default=200,
+                        help="Records of D_test_U_nondep used to pick the threshold. Raising this "
+                             "without --optimize gap skews the threshold toward the majority class")
+    parser.add_argument("--exclude_train_overlap", dest="exclude_train_overlap", action="store_true",
+                        default=True,
+                        help="Drop test prompts that also appear in D_forget (31 in dep, 194 in nondep)")
+    parser.add_argument("--no_exclude_train_overlap", dest="exclude_train_overlap", action="store_false")
 
     # Where the scored position sits. `probing input new` is the DeepSeek analogue of the
     # author's "Answer:" -- it is cut exactly at the API qualifier (np. / torch. / scipy.integrate.),
     # so the next token IS the deprecated-or-updated API name. `probing input` stops one line
     # earlier, at a newline, which is not a decision point.
-    parser.add_argument("--prompt_field", type=str, default="probing input new",
-                        choices=["probing input new", "probing input"])
-    # The valid split of D_forget contains ONLY deprecated cases, so the negative class for
-    # threshold selection has to come from somewhere. See --retain_source.
-    parser.add_argument("--retain_source", type=str, default="nondep_holdout",
-                        choices=["nondep_holdout", "retain_field"])
-    parser.add_argument("--nondep_holdout_frac", type=float, default=0.2,
-                        help="Fraction of D_test_U_nondep held out for threshold calibration; "
-                             "the reported test_nondep stats use the disjoint remainder")
+    parser.add_argument("--prompt_field", type=str, default="probing input",
+                        choices=["probing input", "probing input new"])
 
     # Author's routing knobs (scripts_ref/eval_wmdp_routing.py), same defaults.
     parser.add_argument("--truncate_mode", choices=["left", "head_tail"], default="left")
@@ -477,40 +509,42 @@ def main() -> None:
     orig_model = load_model_maybe_lora(args.original_model_path, None, device)
     ft_model = load_model_maybe_lora(args.finetuned_model_path, args.original_model_path, device)
 
-    # ---- Positive side of the valid split (every D_forget record is a deprecated case) ----
-    raw_data = load_json(args.valid_data_path)
-    valid_data = valid_split(raw_data, args.train_ratio, args.seed)
-    valid_forget_prompts = extract_prompts(valid_data, args.prompt_field)
-    print(f"  valid split: {len(valid_data)}/{len(raw_data)} records, "
-          f"forget prompts={len(valid_forget_prompts)} (field={args.prompt_field!r})")
+    # ---- Build prompt pools --------------------------------------------------------
+    # Training consumes ALL of D_forget, so D_forget is used here only to drop prompts the
+    # model has already seen. Both the threshold and the reported metrics come from the two
+    # test corpora, split disjointly.
+    forget_records = load_json(args.valid_data_path)
+    dep_records = load_json(args.test_dep_path)
+    nondep_records = load_json(args.test_nondep_path)
 
-    test_nondep_all = load_json(args.test_nondep_path)
+    # Mirror the training-time ConvTemplate (see extract_prompts).
+    strip_prompt = (args.prompt_field == "probing input")
+    print(f"  field={args.prompt_field!r} strip={strip_prompt} (matching ConvTemplate)")
 
-    # ---- Negative side for threshold calibration ----
-    if args.retain_source == "retain_field":
-        # Cheapest option, but the `retain` field holds COMPLETE functions: 0/9667 end in the
-        # API-qualifier position that the forget prompts end in. The resulting threshold partly
-        # separates "position type", not "deprecated vs not".
-        valid_retain_prompts = extract_prompts(valid_data, "retain", fallback="retain")
-        nondep_test = test_nondep_all
-        calib_note = "retain field of the valid split (structurally different anchor)"
-    else:
-        # Hold out a slice of D_test_U_nondep. Same construction as the forget prompts, so the
-        # positive and negative classes are structurally identical -- the property the author
-        # relies on with WMDP (forget) vs MMLU (retain), both ending in "Answer:".
-        idx = list(range(len(test_nondep_all)))
-        random.Random(args.seed).shuffle(idx)
-        n_cal = int(len(idx) * float(args.nondep_holdout_frac))
-        cal_idx = sorted(idx[:n_cal])
-        test_idx = sorted(idx[n_cal:])
-        valid_retain_prompts = extract_prompts([test_nondep_all[i] for i in cal_idx], args.prompt_field)
-        nondep_test = [test_nondep_all[i] for i in test_idx]
-        calib_note = (f"{len(cal_idx)}-record holdout of D_test_U_nondep "
-                      f"(reported nondep stats use the disjoint {len(test_idx)})")
-    print(f"  retain/negative source: {calib_note}")
-    print(f"  retain prompts={len(valid_retain_prompts)}")
-    if not valid_forget_prompts or not valid_retain_prompts:
-        raise ValueError("Valid split produced an empty forget or retain prompt set")
+    dep_prompts_all = dedupe(extract_prompts(dep_records, args.prompt_field, strip=strip_prompt))
+    nondep_prompts_all = dedupe(extract_prompts(nondep_records, args.prompt_field, strip=strip_prompt))
+    print(f"  after dedupe: dep={len(dep_prompts_all)} nondep={len(nondep_prompts_all)}")
+
+    n_dep_raw, n_nondep_raw = len(dep_prompts_all), len(nondep_prompts_all)
+    if args.exclude_train_overlap:
+        seen = set(extract_prompts(forget_records, args.prompt_field, strip=strip_prompt))
+        dep_prompts_all = [p for p in dep_prompts_all if p not in seen]
+        nondep_prompts_all = [p for p in nondep_prompts_all if p not in seen]
+        print(f"  dropped train-overlap prompts: dep {n_dep_raw - len(dep_prompts_all)}, "
+              f"nondep {n_nondep_raw - len(nondep_prompts_all)}")
+
+    calib_dep, test_dep_prompts = split_calib_test(dep_prompts_all, args.calib_dep_n, args.seed)
+    calib_nondep, test_nondep_prompts = split_calib_test(nondep_prompts_all, args.calib_nondep_n, args.seed)
+
+    print(f"  calibration: dep={len(calib_dep)} nondep={len(calib_nondep)}")
+    print(f"  test:        dep={len(test_dep_prompts)} nondep={len(test_nondep_prompts)}")
+    if not calib_dep or not calib_nondep:
+        raise ValueError("Empty calibration set -- lower --calib_dep_n / --calib_nondep_n")
+    if not test_dep_prompts or not test_nondep_prompts:
+        raise ValueError("Empty test set -- the calibration slice consumed the whole corpus")
+    if args.optimize == "accuracy" and max(len(calib_dep), len(calib_nondep)) > 3 * min(len(calib_dep), len(calib_nondep)):
+        print("  WARNING: calibration classes are imbalanced and --optimize accuracy follows the "
+              "majority class; use --optimize gap (TPR-FPR) instead")
 
     score_kwargs = dict(
         device=device,
@@ -525,59 +559,66 @@ def main() -> None:
         score_reducer_beta=args.score_reducer_beta,
     )
 
-    print("\nScoring valid split (symmetric KL at last prompt token)...")
-    valid_forget = sym_kl_scores(orig_model, ft_model, tokenizer, valid_forget_prompts,
-                                 tag="valid/forget", **score_kwargs)
-    valid_retain = sym_kl_scores(orig_model, ft_model, tokenizer, valid_retain_prompts,
-                                 tag="valid/retain", **score_kwargs)
+    print("\nScoring calibration split (symmetric KL at last prompt token)...")
+    calib_dep_scores = sym_kl_scores(orig_model, ft_model, tokenizer, calib_dep,
+                                     tag="calib/dep", **score_kwargs)
+    calib_nondep_scores = sym_kl_scores(orig_model, ft_model, tokenizer, calib_nondep,
+                                        tag="calib/nondep", **score_kwargs)
 
-    selection = select_threshold(valid_forget, valid_retain, args.optimize, args.min_tpr, args.max_fpr)
+    selection = select_threshold(calib_dep_scores, calib_nondep_scores,
+                                 args.optimize, args.min_tpr, args.max_fpr)
     threshold = selection["best_threshold"]
 
-    # ---- Test sets ----
-    test_dep = load_json(args.test_dep_path)
-    dep_prompts = extract_prompts(test_dep, args.prompt_field)
-    nondep_prompts = extract_prompts(nondep_test, args.prompt_field)
-    print(f"\nTest sets: D_test_U_dep={len(dep_prompts)} D_test_U_nondep={len(nondep_prompts)}")
+    print("\nScoring test split...")
+    dep_scores = sym_kl_scores(orig_model, ft_model, tokenizer, test_dep_prompts,
+                               tag="test/dep", **score_kwargs)
+    nondep_scores = sym_kl_scores(orig_model, ft_model, tokenizer, test_nondep_prompts,
+                                  tag="test/nondep", **score_kwargs)
 
-    dep_scores = sym_kl_scores(orig_model, ft_model, tokenizer, dep_prompts, tag="test/dep", **score_kwargs)
-    nondep_scores = sym_kl_scores(orig_model, ft_model, tokenizer, nondep_prompts, tag="test/nondep", **score_kwargs)
+    test_metrics = metrics_at_threshold(dep_scores, nondep_scores, threshold)
 
     # ---- Report ----
     m = selection["metrics"]
     print("\n" + "=" * 90)
     print("                        SYMMETRIC-KL ROUTING SCORES")
     print("=" * 90)
-    print(f"  threshold (from valid): {threshold:.6f}   optimize={args.optimize}"
+    print(f"  threshold (from calibration): {threshold:.6f}   optimize={args.optimize}"
           f"   constraints_satisfied={selection['constraints_satisfied']}")
-    print(f"  valid: acc={m['accuracy']*100:.2f}%  tpr={m['tpr']*100:.2f}%  fpr={m['fpr']*100:.2f}%  f1={m['f1']:.4f}")
+    print(f"  calib: acc={m['accuracy']*100:.2f}%  tpr={m['tpr']*100:.2f}%  "
+          f"fpr={m['fpr']*100:.2f}%  f1={m['f1']:.4f}")
+    print(f"  TEST : acc={test_metrics['accuracy']*100:.2f}%  tpr={test_metrics['tpr']*100:.2f}%  "
+          f"fpr={test_metrics['fpr']*100:.2f}%  f1={test_metrics['f1']:.4f}")
     print("-" * 90)
     print(f"  {'dataset':24s} | {'mean':>9s} | {'std':>9s} | {'min':>9s} | {'max':>9s} | {'> thresh':>16s}")
     print("-" * 90)
     stats = {
-        "valid_forget": describe("valid forget (deprecated)", valid_forget, threshold),
-        "valid_retain": describe("valid retain", valid_retain, threshold),
-        "test_dep": describe("D_test_U_dep", dep_scores, threshold),
-        "test_nondep": describe("D_test_U_nondep", nondep_scores, threshold),
+        "calib_dep": describe("calib dep (deprecated)", calib_dep_scores, threshold),
+        "calib_nondep": describe("calib nondep", calib_nondep_scores, threshold),
+        "test_dep": describe("D_test_U_dep (test)", dep_scores, threshold),
+        "test_nondep": describe("D_test_U_nondep (test)", nondep_scores, threshold),
     }
     print("=" * 90)
+    print("  NOTE: ~5.8% of D_test_U_nondep still continues with a deprecated API name,")
+    print("        so a perfect detector would still show roughly that much FPR.")
 
     results = {
         "score": "symmetric_kl",
         "score_position": "last_prompt_token",
         "threshold": threshold,
         "selection": selection,
+        "test_metrics": test_metrics,
         "config": {
             "original_model_path": args.original_model_path,
             "finetuned_model_path": args.finetuned_model_path,
             "max_len": args.max_len,
             "batch_size": args.batch_size,
-            "train_ratio": args.train_ratio,
             "seed": args.seed,
             "prompt_field": args.prompt_field,
-            "retain_source": args.retain_source,
-            "retain_source_note": calib_note,
-            "nondep_holdout_frac": args.nondep_holdout_frac,
+            "calib_dep_n": len(calib_dep),
+            "calib_nondep_n": len(calib_nondep),
+            "test_dep_n": len(test_dep_prompts),
+            "test_nondep_n": len(test_nondep_prompts),
+            "exclude_train_overlap": bool(args.exclude_train_overlap),
             "truncate_mode": args.truncate_mode,
             "score_last_k": max(1, int(args.score_last_k)),
             "score_k_mode": args.score_k_mode,
@@ -588,8 +629,8 @@ def main() -> None:
         },
         "stats": stats,
         "scores": {
-            "valid_forget": valid_forget.tolist(),
-            "valid_retain": valid_retain.tolist(),
+            "calib_dep": calib_dep_scores.tolist(),
+            "calib_nondep": calib_nondep_scores.tolist(),
             "test_dep": dep_scores.tolist(),
             "test_nondep": nondep_scores.tolist(),
         },
