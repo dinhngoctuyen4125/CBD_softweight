@@ -10,10 +10,8 @@ solve the generalized eigen problem using a low-rank Woodbury formulation.
 import os
 import json
 import argparse
-import mmap
 import pickle
 import random
-import shutil
 import time
 import math
 import numpy as np
@@ -25,6 +23,100 @@ from peft import LoraConfig, get_peft_model
 from uld.data.conv_util import create_template
 
 
+def load_local_tofu(split_name):
+    local_tofu_path = os.environ.get("TOFU_DATA_NAME") or os.path.join(
+        os.environ.get("CBD_DATA_ROOT", "data"), "TOFU"
+    )
+    json_file = os.path.join(local_tofu_path, f"{split_name}.json")
+    if not os.path.exists(json_file):
+        from datasets import load_dataset
+        return load_dataset("locuslab/TOFU", split_name)["train"]
+
+    try:
+        with open(json_file, "r", encoding="utf-8") as f:
+            first_non_ws = ""
+            while True:
+                ch = f.read(1)
+                if not ch:
+                    break
+                if not ch.isspace():
+                    first_non_ws = ch
+                    break
+            f.seek(0)
+            if first_non_ws == "[":
+                data = json.load(f)
+            else:
+                data = []
+                for line in f:
+                    if line.strip():
+                        data.append(json.loads(line.strip()))
+    except json.JSONDecodeError:
+        data = []
+        with open(json_file, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    data.append(json.loads(line.strip()))
+    return datasets.Dataset.from_list(data)
+
+def _read_jsonl(path: str):
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
+def _format_mcq_prompt(subject: str, question: str, choices):
+    subject = str(subject).replace("_", " ").strip()
+    a, b, c, d = (list(choices) + ["", "", "", ""])[:4]
+    return (
+        f"The following are multiple choice questions (with answers) about {subject}.\n\n"
+        f"{question}\n\n"
+        f"A. {a}\n\n"
+        f"B. {b}\n\n"
+        f"C. {c}\n\n"
+        f"D. {d}\n\n"
+        f"Answer:"
+    )
+
+
+def _ans_letter(answer_idx: int) -> str:
+    return ["A", "B", "C", "D"][int(answer_idx)]
+
+
+def load_wmdp_mcq(domains_csv: str):
+    data_root = os.environ.get("CBD_DATA_ROOT", "data")
+    domain_map = {"bio": ("bio_questions.json", "biology"), "cyber": ("cyber_questions.json", "cybersecurity"), "chem": ("chem_questions.json", "chemistry")}
+    domains = [d.strip().lower() for d in str(domains_csv).split(",") if d.strip()]
+    rows = []
+    for d in domains:
+        if d not in domain_map:
+            raise ValueError(f"Unknown WMDP domain: {d!r} (expected one of {sorted(domain_map)})")
+        fname, subject = domain_map[d]
+        path = os.path.join(data_root, "eval-method", "wmdp", "data", "wmdp_mcqs", "wmdp-mcqs", fname)
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for ex in data:
+            prompt = _format_mcq_prompt(subject, ex["question"], ex["choices"])
+            rows.append({"question": prompt, "answer": _ans_letter(ex["answer"])})
+    return datasets.Dataset.from_list(rows)
+
+
+def load_mmlu_mcq(jsonl_path: str, subjects_csv=None):
+    rows = []
+    subjects = None
+    if subjects_csv:
+        subjects = {s.strip() for s in subjects_csv.split(",") if s.strip()}
+    for ex in _read_jsonl(jsonl_path):
+        subject = ex.get("subject") or "general"
+        if subjects is not None and subject not in subjects:
+            continue
+        prompt = _format_mcq_prompt(subject, ex["question"], ex["choices"])
+        rows.append({"question": prompt, "answer": _ans_letter(ex["answer"])})
+    return datasets.Dataset.from_list(rows)
 
 
 def build_lora_model(base_model_name, r, alpha, dropout, target_modules):
@@ -32,7 +124,7 @@ def build_lora_model(base_model_name, r, alpha, dropout, target_modules):
         base_model_name,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        local_files_only=False,
+        local_files_only=True,
     )
     lora_config = LoraConfig(
         r=r,
@@ -123,99 +215,6 @@ def _compute_per_sample_loss(logits, labels):
     return loss_per_sample
 
 
-# numpy has no bfloat16, so that option is widened to float32 on disk.
-_DISK_DTYPE = {"float16": np.float16, "bfloat16": np.float32, "float32": np.float32}
-
-# Rows buffered per layer before we msync and drop the mapping. 256 rows is ~92 MB per
-# layer, so at most ~2 GB of dirty pages across 22 layers can be outstanding at once.
-_GRAD_FLUSH_ROWS = 256
-
-
-def _rss_report() -> str:
-    """Report the RSS split so a run says for itself whether memory is anonymous."""
-    try:
-        vals = {}
-        with open("/proc/self/status", "r") as f:
-            for line in f:
-                if line.startswith(("VmRSS:", "RssAnon:", "RssFile:", "RssShmem:")):
-                    key, val = line.split(":", 1)
-                    vals[key] = int(val.split()[0]) / 1048576.0  # kB -> GiB
-        if not vals:
-            return ""
-        return " rss={:.1f}G anon={:.1f}G file={:.1f}G".format(
-            vals.get("VmRSS", 0.0),
-            vals.get("RssAnon", 0.0),
-            vals.get("RssFile", 0.0) + vals.get("RssShmem", 0.0),
-        )
-    except Exception:
-        return ""
-
-
-class _GradStore:
-    """Per-layer per-sample gradient matrix [n, d], backed by an on-disk memmap.
-
-    Holding every gradient in RAM costs n * d * 22 layers * 2 bytes -- 57 GiB per split
-    at n=7733, d=180224 -- and that is anonymous heap, which the kernel cannot reclaim,
-    so the process gets OOM-killed. Memmap pages are ordinary page cache: they can be
-    evicted under pressure and faulted back in on demand, so resident memory stays flat.
-    """
-
-    __slots__ = ("path", "dim", "n", "_mm", "_pending")
-
-    def __init__(self, path, capacity, dim, np_dtype):
-        self.path = path
-        self.dim = int(dim)
-        self.n = 0
-        self._pending = 0
-        self._mm = np.memmap(path, dtype=np_dtype, mode="w+", shape=(int(capacity), self.dim))
-
-    def append(self, block):
-        b = int(block.shape[0])
-        self._mm[self.n:self.n + b] = block.numpy()
-        self.n += b
-        self._pending += b
-        if self._pending >= _GRAD_FLUSH_ROWS:
-            self.release()
-
-    def release(self):
-        """msync the dirty pages, then drop them from our page table.
-
-        Without this, dirty pages accumulate until writeback catches up. That is harmless
-        on a machine with slack, but under a cgroup memory limit -- where page cache counts
-        toward the limit -- it can still trigger an OOM kill. MADV_DONTNEED only discards
-        this process's mapping; the data is already msync'd to the file and faults back in
-        on the next read.
-        """
-        self._pending = 0
-        try:
-            self._mm.flush()
-        except Exception:
-            return
-        raw = getattr(self._mm, "_mmap", None)
-        if raw is None:
-            return
-        try:
-            raw.madvise(mmap.MADV_DONTNEED)
-        except (AttributeError, OSError, ValueError):
-            pass
-
-    def rows(self):
-        return self._mm[:self.n]
-
-    def close(self):
-        try:
-            self._mm.flush()
-        except Exception:
-            pass
-        self._mm = None
-
-
-def close_grad_stores(grads):
-    for store in (grads or {}).values():
-        if isinstance(store, _GradStore):
-            store.close()
-
-
 def collect_gradients(
     model,
     tokenizer,
@@ -225,30 +224,18 @@ def collect_gradients(
     max_len,
     batch_size=1,
     store_dtype="float16",
-    cache_dir=None,
-    tag="split",
 ):
     grads = {}
     target_params = []
     for name, param in model.named_parameters():
         if "lora_B" in name and "up_proj" in name and "default" in name:
             target_params.append((name, param))
-
-    total = min(len(dataset), max_samples)
-    if cache_dir is not None:
-        os.makedirs(cache_dir, exist_ok=True)
-        np_dtype = _DISK_DTYPE[store_dtype]
-        for idx, (name, param) in enumerate(target_params):
-            safe = name.replace(".", "_").replace("/", "_")
-            path = os.path.join(cache_dir, f"{tag}.{idx:03d}.{safe}.grad")
-            grads[name] = _GradStore(path, total, param.numel(), np_dtype)
-    else:
-        for name, _ in target_params:
             grads[name] = []
 
     device = next(model.parameters()).device
     model.eval()
 
+    total = min(len(dataset), max_samples)
     t0 = time.perf_counter()
     kept = 0
     batch_size = max(int(batch_size), 1)
@@ -298,27 +285,22 @@ def collect_gradients(
             g = g.detach()
             if store_dtype == "float16":
                 g = g.to(torch.float16)
-            elif store_dtype == "bfloat16" and cache_dir is None:
+            elif store_dtype == "bfloat16":
                 g = g.to(torch.bfloat16)
             else:
-                # numpy cannot hold bfloat16; widen so the memmap path stays lossless.
                 g = g.to(torch.float32)
             grads[name].append(g.reshape(b, -1).cpu())
 
         kept += b
         if kept > 0 and kept % 50 == 0:
             dt = time.perf_counter() - t0
-            print(f"[collect_gradients] kept={kept}/{total} avg_sec={dt/kept:.3f}{_rss_report()}")
+            print(f"[collect_gradients] kept={kept}/{total} avg_sec={dt/kept:.3f}")
 
     dt = time.perf_counter() - t0
     if kept == 0:
         print("[collect_gradients] WARNING: kept=0 (all samples had no supervised tokens after truncation)")
     else:
-        print(f"[collect_gradients] done kept={kept}/{total} sec={dt:.1f} avg_sec={dt/kept:.3f}{_rss_report()}")
-    for store in grads.values():
-        if isinstance(store, _GradStore):
-            store.release()
-    print(f"[collect_gradients] flushed tag={tag}{_rss_report()}")
+        print(f"[collect_gradients] done kept={kept}/{total} sec={dt:.1f} avg_sec={dt/kept:.3f}")
     return grads
 
 
@@ -337,32 +319,6 @@ def _concat_grad_chunks(chunks):
     if torch.is_tensor(first) and first.dim() == 1:
         return torch.stack(chunks, dim=0)
     raise ValueError(f"Unsupported gradient chunk type: {type(first)}")
-
-
-def _load_layer_matrix(source, device, chunk_rows=256):
-    """Return one layer's gradients as [d, n] float32 on `device`.
-
-    Built column-block by column-block so we never hold an [n, d] copy and its [d, n]
-    transpose at the same time; each of those is 5.6 GB at n=7733, d=180224.
-    """
-    if source is None:
-        return None
-    if isinstance(source, _GradStore):
-        n, d = source.n, source.dim
-        if n == 0:
-            return None
-        rows = source.rows()
-        out = torch.empty((d, n), device=device, dtype=torch.float32)
-        for i in range(0, n, chunk_rows):
-            block = torch.from_numpy(np.ascontiguousarray(rows[i:i + chunk_rows]))
-            block = block.to(device=device, dtype=torch.float32)
-            out[:, i:i + block.shape[0]] = block.t()
-            del block
-        return out
-    mat = _concat_grad_chunks(source)
-    if mat is None:
-        return None
-    return mat.to(device=device, dtype=torch.float32).t().contiguous()
 
 
 def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, target_variance, top_k):
@@ -392,17 +348,17 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
 
     for layer_name in forget_grads:
         layer_t0 = time.perf_counter()
+        f_mat = _concat_grad_chunks(forget_grads[layer_name])  # [n_f, d]
+        r_mat = _concat_grad_chunks(retain_grads.get(layer_name, []))  # [n_r, d]
+        if f_mat is None or r_mat is None:
+            continue
+
         # Build G_f and G_r from per-sample flattened gradients.
         # Each sample gradient is a vector in R^d where d = out_dim * r (LoRA-B).
-        # Only ONE layer is resident at a time: with disk-backed stores this bounds memory
-        # at O(one layer) instead of O(all layers), which is what makes the full run fit.
         # We move the heavy linear algebra to GPU when available, otherwise limit CPU threads.
         # Keep compute in float32 for stable eigh/qr.
-        G_f = _load_layer_matrix(forget_grads.get(layer_name), compute_device)  # [d, n_f]
-        G_r = _load_layer_matrix(retain_grads.get(layer_name), compute_device)  # [d, n_r]
-        if G_f is None or G_r is None:
-            G_f = G_r = None
-            continue
+        G_f = f_mat.to(device=compute_device, dtype=torch.float32).t().contiguous()  # [d, n_f]
+        G_r = r_mat.to(device=compute_device, dtype=torch.float32).t().contiguous()  # [d, n_r]
 
         n_f = G_f.size(1)
         n_r = G_r.size(1)
@@ -422,34 +378,27 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
         # Compute small matrices
         K_r = G_r.t().matmul(G_r)  # [n_r, n_r]
         K_rf = G_r.t().matmul(G_f)  # [n_r, n_f]
-        K_f = G_f.t().matmul(G_f)  # [n_f, n_f]
         eye_r = torch.eye(n_r, dtype=K_r.dtype, device=compute_device)
 
-        # Z = (F_r + mu*I)^-1 G_f is [d, n_f] -- 5.6 GB at d=180224, n_f=7733. We never
-        # materialize it, because both places it appears collapse onto the small n x n
-        # matrices we already have (X = (K_r + n_r*mu*I)^-1 K_rf):
-        #     M = G_f^T Z / n_f = (K_f - K_rf^T X) / (mu * n_f)
-        #     Q = Z u           = (G_f u - G_r (X u)) / mu     with u only k columns wide
-        # Algebraically identical to the explicit form, one 5.6 GB buffer cheaper.
-        #
         # Numerical guard: for some large/ill-conditioned layers, low mu can produce
-        # non-finite X/M while solve itself succeeds. We only escalate mu on failure.
+        # non-finite Z/M while solve itself succeeds. We only escalate mu on failure.
         M = None
-        X = None
+        Z = None
         mu_eff = mu_layer
         for _attempt in range(8):
             try:
                 A = K_r + (n_r * mu_eff) * eye_r  # [n_r, n_r], SPD
                 try:
                     L = torch.linalg.cholesky(A)
-                    X_try = torch.cholesky_solve(K_rf, L)  # [n_r, n_f]
+                    X = torch.cholesky_solve(K_rf, L)  # [n_r, n_f]
                 except RuntimeError:
                     # Fallback to generic solver if Cholesky fails.
-                    X_try = torch.linalg.solve(A, K_rf)
+                    X = torch.linalg.solve(A, K_rf)
 
-                M_try = (K_f - K_rf.t().matmul(X_try)) / (mu_eff * float(n_f))
-                if torch.isfinite(X_try).all() and torch.isfinite(M_try).all():
-                    X = X_try
+                Z_try = (1.0 / mu_eff) * (G_f - G_r.matmul(X))
+                M_try = (G_f.t().matmul(Z_try)) / float(n_f)
+                if torch.isfinite(Z_try).all() and torch.isfinite(M_try).all():
+                    Z = Z_try
                     M = M_try
                     mu_layer = mu_eff
                     break
@@ -457,13 +406,13 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
                 pass
             mu_eff *= 10.0
 
-        if M is None or X is None:
+        if M is None or Z is None:
             # CPU-float64 fallback for pathological layers; only active on numerical failure.
-            # Only the n x n matrices are promoted to float64, so this stays affordable.
-            K_r_cpu = K_r.detach().to(device="cpu", dtype=torch.float64)
-            K_rf_cpu = K_rf.detach().to(device="cpu", dtype=torch.float64)
-            K_f_cpu = K_f.detach().to(device="cpu", dtype=torch.float64)
-            eye_r_cpu = torch.eye(n_r, dtype=torch.float64, device="cpu")
+            G_f_cpu = G_f.detach().to(device="cpu", dtype=torch.float64)
+            G_r_cpu = G_r.detach().to(device="cpu", dtype=torch.float64)
+            K_r_cpu = G_r_cpu.t().matmul(G_r_cpu)
+            K_rf_cpu = G_r_cpu.t().matmul(G_f_cpu)
+            eye_r_cpu = torch.eye(n_r, dtype=K_r_cpu.dtype, device="cpu")
             mu_eff_cpu = max(mu_layer, 1e-8)
             ok_cpu = False
             for _attempt in range(10):
@@ -474,9 +423,10 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
                         X_cpu = torch.cholesky_solve(K_rf_cpu, L_cpu)
                     except RuntimeError:
                         X_cpu = torch.linalg.solve(A_cpu, K_rf_cpu)
-                    M_cpu = (K_f_cpu - K_rf_cpu.t().matmul(X_cpu)) / (mu_eff_cpu * float(n_f))
-                    if torch.isfinite(X_cpu).all() and torch.isfinite(M_cpu).all():
-                        X = X_cpu.to(device=compute_device, dtype=torch.float32)
+                    Z_cpu = (1.0 / mu_eff_cpu) * (G_f_cpu - G_r_cpu.matmul(X_cpu))
+                    M_cpu = (G_f_cpu.t().matmul(Z_cpu)) / float(n_f)
+                    if torch.isfinite(Z_cpu).all() and torch.isfinite(M_cpu).all():
+                        Z = Z_cpu.to(device=compute_device, dtype=torch.float32)
                         M = M_cpu.to(device=compute_device, dtype=torch.float32)
                         mu_layer = float(mu_eff_cpu)
                         ok_cpu = True
@@ -486,7 +436,7 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
                 mu_eff_cpu *= 10.0
             if not ok_cpu:
                 print(f"[compute_cbd_dfb_basis] WARN skip_layer_nonfinite layer={layer_name}")
-                G_f = G_r = K_r = K_rf = K_f = eye_r = A = L = X = M = None
+                del G_f, G_r, K_r, K_rf, eye_r
                 if compute_device.type == "cuda":
                     torch.cuda.empty_cache()
                 continue
@@ -570,7 +520,7 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
                         U_np, S_np, _ = np.linalg.svd(M_np, full_matrices=False)
                         if (not np.isfinite(S_np).all()) or (not np.isfinite(U_np).all()):
                             print(f"[compute_cbd_dfb_basis] WARN skip_layer_nonfinite_svd layer={layer_name}")
-                            G_f = G_r = K_r = K_rf = K_f = eye_r = X = M = M_sym = eye_m = None
+                            del G_f, G_r, K_r, K_rf, eye_r, Z, M, M_sym, eye_m
                             if compute_device.type == "cuda":
                                 torch.cuda.empty_cache()
                             continue
@@ -596,8 +546,7 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
                     k = 1
         u = eigvecs[:, :k]
         eigvals_k = eigvals[:k].clamp(min=0)
-        # Q = Z u, expanded so Z is never formed. X.matmul(u) is [n_r, k] -- negligible.
-        Q = (G_f.matmul(u) - G_r.matmul(X.matmul(u))) / mu_layer  # [out_dim, k]
+        Q = Z.matmul(u)  # [out_dim, k]
 
         # Orthonormalize Q
         Q, _ = torch.linalg.qr(Q)
@@ -609,8 +558,7 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
 
         if (not torch.isfinite(Q_T).all()) or (not torch.isfinite(eigvals_k).all()) or (not torch.isfinite(retain_proj).all()):
             print(f"[compute_cbd_dfb_basis] WARN skip_layer_nonfinite_outputs layer={layer_name}")
-            G_f = G_r = K_r = K_rf = K_f = eye_r = X = M = M_sym = eye_m = None
-            eigvals = eigvecs = u = Q = Q_T = retain_proj = None
+            del G_f, G_r, K_r, K_rf, eye_r, Z, M, M_sym, eye_m, eigvals, eigvecs, u, Q, Q_T, retain_proj
             if compute_device.type == "cuda":
                 torch.cuda.empty_cache()
             continue
@@ -630,10 +578,8 @@ def compute_cbd_dfb_basis(forget_grads, retain_grads, mu, mu_mode, mu_scale, tar
         layer_dt = time.perf_counter() - layer_t0
         print(f"[compute_cbd_dfb_basis] layer={layer_name} k={basis[layer_name]['n_components']} sec={layer_dt:.2f}")
 
-        # Free per-layer tensors early to keep memory bounded. Assignment rather than `del`
-        # because some names stay unbound when a numerical fallback path was taken.
-        G_f = G_r = K_r = K_rf = K_f = eye_r = A = L = X = M = M_sym = eye_m = None
-        eigvals = eigvecs = u = Q = Q_T = retain_proj = None
+        # Free per-layer tensors early to keep memory bounded.
+        del G_f, G_r, K_r, K_rf, eye_r, A, X, Z, M, M_sym, eye_m, eigvals, eigvecs, u, Q, Q_T
         if compute_device.type == "cuda":
             torch.cuda.empty_cache()
 
@@ -644,16 +590,17 @@ def main():
     parser = argparse.ArgumentParser(description="Extract CBD-DFB basis from gradients")
     parser.add_argument("--base_model_name", type=str, default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     parser.add_argument("--seed", type=int, default=42, help="随机种子（用于对齐 LoRA A 初始化）")
-    parser.add_argument("--data_path", type=str, default="../Data-Collection/deepseek/D_forget.json", help="Path to DeepSeek D_forget.json")
-    parser.add_argument("--train_ratio", type=float, default=0.8, help="Train/valid split ratio for DeepSeek data")
+    parser.add_argument("--dataset", type=str, default="tofu", choices=["tofu", "wmdp_mcq"], help="数据来源：ToFU(split) 或 WMDP/MMLU(MCQ)")
+    parser.add_argument("--forget_split", type=str, default=None, help="ToFU forget split（dataset=tofu 时必填）")
+    parser.add_argument("--retain_split", type=str, default=None, help="ToFU retain split（dataset=tofu 时必填）")
+    parser.add_argument("--wmdp_domains", type=str, default="bio,cyber", help="WMDP domains for forget (dataset=wmdp_mcq)")
+    parser.add_argument("--mmlu_retain_file", type=str, default="eval-method/wmdp/data/mmlu/all_auxiliary_train.jsonl", help="Local MMLU JSONL (run scripts/cache_mmlu.py)")
+    parser.add_argument("--mmlu_retain_subjects", type=str, default=None, help="Optional comma-separated subject filter for MMLU retain")
     parser.add_argument("--max_forget", type=int, default=400)
     parser.add_argument("--max_retain", type=int, default=400)
     parser.add_argument("--max_len", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=1, help="梯度收集 batch size（>1 会用 per-sample autograd 批量提取）")
-    parser.add_argument("--grad_store_dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"], help="存储梯度的 dtype（仅影响内存/磁盘/速度）")
-    parser.add_argument("--grad_cache_dir", type=str, default=None, help="梯度 memmap 缓存目录（默认 <output_dir>/grad_cache）")
-    parser.add_argument("--in_memory_grads", action="store_true", help="把全部梯度留在 RAM（旧行为，大样本量会 OOM）")
-    parser.add_argument("--keep_grad_cache", action="store_true", help="结束后保留梯度缓存文件")
+    parser.add_argument("--grad_store_dtype", type=str, default="float16", choices=["float16", "bfloat16", "float32"], help="CPU 上存储梯度的 dtype（仅影响内存/速度）")
     parser.add_argument("--refuse_forget", action="store_true", help="将 forget 的答案替换为固定拒答（需与训练 data_mode 对齐）")
     parser.add_argument("--refuse_answer", type=str, default="I don't know.", help="refuse_forget 时使用的拒答文本")
     parser.add_argument("--mu", type=float, default=1e-3)
@@ -699,15 +646,28 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model_name, local_files_only=False)
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model_name, local_files_only=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    conv_template_cfg = {
-        "question_start_token": "",
-        "question_end_token": "",
-        "answer_token": "",
-        "max_len": args.max_len,
-    }
+    if args.dataset == "wmdp_mcq":
+        # MCQ prompts can be long; keep the suffix containing choices + "Answer:".
+        tokenizer.truncation_side = "left"
+        conv_template_cfg = {
+            "question_start_token": "",
+            "question_end_token": "",
+            # Add a trailing space so the next-token distribution corresponds to the choice letter.
+            "answer_token": " ",
+            # Preserve trailing space in answer_token (avoid .strip()).
+            "strip_prompt": False,
+            "max_len": args.max_len,
+        }
+    else:
+        conv_template_cfg = {
+            "question_start_token": "question: ",
+            "question_end_token": " answer:",
+            "answer_token": "",
+            "max_len": args.max_len,
+        }
     conv_template = create_template(conv_template_cfg, tokenizer=tokenizer, max_len=args.max_len)
 
     model = build_lora_model(
@@ -723,31 +683,26 @@ def main():
         if "lora_A" in name:
             param.requires_grad = False
 
-    # Load DeepSeek data
-    data_path = args.data_path
-    if not os.path.isabs(data_path):
-        data_path = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), data_path)
-    if not os.path.exists(data_path):
-        raise FileNotFoundError(f"Data file not found: {data_path}")
-    print(f"[DeepSeek] Loading data from {data_path}")
-    with open(data_path, "r", encoding="utf-8") as f:
-        raw_data = json.load(f)
-    # Split into train/valid, only use train portion for basis extraction
-    n_total = len(raw_data)
-    n_train = int(n_total * args.train_ratio)
-    indices = list(range(n_total))
-    rng = random.Random(args.seed)
-    rng.shuffle(indices)
-    train_indices = sorted(indices[:n_train])
-    train_data = [raw_data[i] for i in train_indices]
-    # Build forget (y_neg) and retain (y_pos) datasets
-    forget_list = [{"question": item["probing input"], "answer": item["y_neg"]} for item in train_data if item.get("probing input") and item.get("y_neg")]
-    retain_list = [{"question": item["probing input"], "answer": item["y_pos"]} for item in train_data if item.get("probing input") and item.get("y_pos")]
-    forget_ds = datasets.Dataset.from_list(forget_list)
-    retain_ds = datasets.Dataset.from_list(retain_list)
-    forget_tag = "deepseek_forget"
-    retain_tag = "deepseek_retain"
-    print(f"[DeepSeek] Train split: {len(train_data)}/{n_total} samples, forget={len(forget_ds)}, retain={len(retain_ds)}")
+    if args.dataset == "wmdp_mcq":
+        mmlu_path = args.mmlu_retain_file
+        if not os.path.isabs(mmlu_path):
+            mmlu_path = os.path.join(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")), mmlu_path)
+        if not os.path.exists(mmlu_path):
+            raise FileNotFoundError(
+                f"MMLU retain file not found: {mmlu_path}. "
+                f"Run: HF_ENDPOINT=https://hf-mirror.com python3 scripts/cache_mmlu.py"
+            )
+        forget_ds = load_wmdp_mcq(args.wmdp_domains)
+        retain_ds = load_mmlu_mcq(mmlu_path, subjects_csv=args.mmlu_retain_subjects)
+        forget_tag = f"wmdp_{args.wmdp_domains.replace(',', '_')}"
+        retain_tag = "mmlu"
+    else:
+        if not args.forget_split or not args.retain_split:
+            raise ValueError("--forget_split and --retain_split are required when --dataset=tofu")
+        forget_ds = load_local_tofu(args.forget_split)
+        retain_ds = load_local_tofu(args.retain_split)
+        forget_tag = args.forget_split
+        retain_tag = args.retain_split
 
     if args.refuse_forget:
         replaced = []
@@ -765,43 +720,6 @@ def main():
 
     print(f"Forget samples: {len(forget_ds)}, Retain samples: {len(retain_ds)}")
 
-    # ---- Memory / disk preflight -------------------------------------------------
-    n_layers = sum(
-        1 for n, _ in model.named_parameters()
-        if "lora_B" in n and "up_proj" in n and "default" in n
-    )
-    dim = max(
-        (p.numel() for n, p in model.named_parameters()
-         if "lora_B" in n and "up_proj" in n and "default" in n),
-        default=0,
-    )
-    itemsize = np.dtype(_DISK_DTYPE[args.grad_store_dtype]).itemsize
-    bytes_forget = len(forget_ds) * dim * itemsize * n_layers
-    bytes_retain = len(retain_ds) * dim * itemsize * n_layers
-    need_bytes = bytes_forget + bytes_retain
-    peak_vram = (len(forget_ds) + len(retain_ds)) * dim * 4
-    print(
-        f"[preflight] layers={n_layers} dim={dim} itemsize={itemsize}\n"
-        f"[preflight] gradient bytes: forget={bytes_forget/1e9:.1f} GB "
-        f"retain={bytes_retain/1e9:.1f} GB total={need_bytes/1e9:.1f} GB\n"
-        f"[preflight] peak VRAM for G_f+G_r (float32) ~= {peak_vram/1e9:.1f} GB per layer"
-    )
-
-    cache_dir = None
-    if not args.in_memory_grads:
-        cache_dir = args.grad_cache_dir or os.path.join(args.output_dir, "grad_cache")
-        os.makedirs(cache_dir, exist_ok=True)
-        free_bytes = shutil.disk_usage(cache_dir).free
-        print(f"[preflight] grad cache -> {os.path.abspath(cache_dir)} (free {free_bytes/1e9:.1f} GB)")
-        if free_bytes < need_bytes * 1.05:
-            raise RuntimeError(
-                f"Not enough free disk for the gradient cache: need ~{need_bytes/1e9:.1f} GB, "
-                f"have {free_bytes/1e9:.1f} GB at {os.path.abspath(cache_dir)}. "
-                f"Point --grad_cache_dir at a larger volume, or lower --max_forget/--max_retain."
-            )
-    else:
-        print(f"[preflight] WARNING --in_memory_grads: needs ~{need_bytes/1e9:.1f} GB of RAM")
-
     t0 = time.perf_counter()
     forget_grads = collect_gradients(
         model,
@@ -812,8 +730,6 @@ def main():
         args.max_len,
         batch_size=args.batch_size,
         store_dtype=args.grad_store_dtype,
-        cache_dir=cache_dir,
-        tag="forget",
     )
     t_forget = time.perf_counter()
     retain_grads = collect_gradients(
@@ -825,29 +741,18 @@ def main():
         args.max_len,
         batch_size=args.batch_size,
         store_dtype=args.grad_store_dtype,
-        cache_dir=cache_dir,
-        tag="retain",
     )
     t_retain = time.perf_counter()
 
-    # The model is no longer needed; release its VRAM before the linear algebra.
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    try:
-        basis = compute_cbd_dfb_basis(
-            forget_grads,
-            retain_grads,
-            mu=args.mu,
-            mu_mode=args.mu_mode,
-            mu_scale=args.mu_scale,
-            target_variance=args.target_variance,
-            top_k=args.top_k,
-        )
-    finally:
-        close_grad_stores(forget_grads)
-        close_grad_stores(retain_grads)
+    basis = compute_cbd_dfb_basis(
+        forget_grads,
+        retain_grads,
+        mu=args.mu,
+        mu_mode=args.mu_mode,
+        mu_scale=args.mu_scale,
+        target_variance=args.target_variance,
+        top_k=args.top_k,
+    )
     t_basis = time.perf_counter()
     print(f"[timing] forget_grads_sec={t_forget - t0:.1f} retain_grads_sec={t_retain - t_forget:.1f} basis_sec={t_basis - t_retain:.1f} total_sec={t_basis - t0:.1f}")
 
@@ -857,10 +762,12 @@ def main():
 
     config = {
         "base_model_name": args.base_model_name,
-        "data_path": args.data_path,
-        "train_ratio": args.train_ratio,
-        "seed": args.seed,
-        "max_len": args.max_len,
+        "dataset": args.dataset,
+        "forget_split": args.forget_split,
+        "retain_split": args.retain_split,
+        "wmdp_domains": args.wmdp_domains,
+        "mmlu_retain_file": args.mmlu_retain_file,
+        "mmlu_retain_subjects": args.mmlu_retain_subjects,
         "max_forget": args.max_forget,
         "max_retain": args.max_retain,
         "mu": args.mu,
@@ -885,10 +792,6 @@ def main():
         json.dump(config, f, indent=2)
 
     print(f"Saved basis to {basis_path}")
-
-    if cache_dir is not None and not args.keep_grad_cache:
-        shutil.rmtree(cache_dir, ignore_errors=True)
-        print(f"Removed gradient cache {cache_dir}")
 
 
 if __name__ == "__main__":

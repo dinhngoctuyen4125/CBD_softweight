@@ -155,7 +155,7 @@ run_infer() {
         --seed ${SEED}
 
     echo ""
-    echo "✅ Inference hoàn tất → ${EVAL_OUTPUT_DIR}/weight_statistics.json"
+    echo "✅ Inference hoàn tất → ${EVAL_OUTPUT_DIR}/routing_statistics.json"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
