@@ -7,6 +7,7 @@ import torch
 import random
 import numpy as np
 import json
+from pathlib import Path
 from omegaconf import OmegaConf
 from hydra.core.hydra_config import HydraConfig
 
@@ -346,6 +347,12 @@ def main(configs):
     logging_steps = max(1, logging_steps)
     train_optim = os.environ.get("TRAIN_OPTIM", "adamw_torch").strip() or "adamw_torch"
     print(f"train_optim={train_optim}")
+    try:
+        save_total_limit = int(os.environ.get("SAVE_TOTAL_LIMIT", "1"))
+    except Exception:
+        save_total_limit = 1
+    save_total_limit = max(1, save_total_limit)
+    print(f"save_total_limit={save_total_limit}")
 
     # TrainingArguments has breaking changes across transformers versions (e.g. eval_strategy vs evaluation_strategy).
     # Build kwargs and filter by the installed version's signature for robustness.
@@ -403,7 +410,10 @@ def main(configs):
         output_dir=checkpoint_dir,
         optim=train_optim,
         save_only_model=True,
-        save_total_limit=1,
+        # Keeping only the last checkpoint leaves no way to pick an epoch afterwards, and
+        # this setup has no validation set to early-stop on. Raise SAVE_TOTAL_LIMIT to keep
+        # one checkpoint per epoch and choose later on the calibration split.
+        save_total_limit=save_total_limit,
         ddp_find_unused_parameters=ddp_find_unused_parameters,
         ddp_static_graph=ddp_static_graph,
         deepspeed=deepspeed_configfile,
@@ -687,7 +697,16 @@ def main(configs):
             trainer.save_model(final_ckpt_dir)
 
     if local_rank == 0:
-        os.symlink(output_dir, os.path.join(checkpoint_dir, "trainlogdir"))
+        # Convenience link only. It must never take down a run that has already finished
+        # training and saved its checkpoint (a stale link, or a filesystem without symlink
+        # permission, would otherwise make the process exit non-zero and stop the pipeline).
+        link_path = os.path.join(checkpoint_dir, "trainlogdir")
+        try:
+            if os.path.islink(link_path):
+                os.unlink(link_path)
+            os.symlink(output_dir, link_path)
+        except OSError as exc:
+            print(f"[train] skip trainlogdir symlink ({exc})")
 
 if __name__ == "__main__":
     cleaned_argv = []

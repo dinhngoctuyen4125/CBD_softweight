@@ -23,6 +23,18 @@ from transformers.training_args import TrainingArguments
 from ..data.datamodule import EqualForgetRetainSampler
 
 
+def loss_scalar(value):
+    """Collapse a loss to a Python float for logging.
+
+    Under nn.DataParallel the Trainer gathers one loss per replica, so these arrive as a
+    vector of length n_gpu rather than a scalar and .item() raises. training_step already
+    means() the loss before backward; this keeps the logging path consistent with that.
+    """
+    if torch.is_tensor(value):
+        return value.mean().item() if value.numel() != 1 else value.item()
+    return float(value)
+
+
 class ForgetTrainer(Trainer):
 
     def __init__(self, model, train_loss_function: Callable, is_deepspeed=False, oracle_model=None, equal_sampler=False, seed=42, is_offset=False, oracle_on_cpu=False, **kwargs):
@@ -146,9 +158,9 @@ class ForgetTrainer(Trainer):
         #! Notice that these are evaluated on mini-batch instead of total effective batch 
         if self._should_log_trainloss():
             logitems = {
-                'trainloss/loss': loss.item(),
-                'trainloss/forgetloss': forgetloss.item(),
-                'trainloss/retainloss': retainloss.item()
+                'trainloss/loss': loss_scalar(loss),
+                'trainloss/forgetloss': loss_scalar(forgetloss),
+                'trainloss/retainloss': loss_scalar(retainloss)
             }
             self.log(logitems)
 

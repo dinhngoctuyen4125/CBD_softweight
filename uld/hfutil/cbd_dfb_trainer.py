@@ -6,7 +6,7 @@ Project gradients onto discriminative subspace Q (generalized eigenvectors).
 import math
 import torch
 from typing import Callable, Dict, Optional
-from .hf_trainers import ForgetTrainer
+from .hf_trainers import ForgetTrainer, loss_scalar
 
 
 class CBDDFBForgetTrainer(ForgetTrainer):
@@ -296,11 +296,11 @@ class CBDDFBForgetTrainer(ForgetTrainer):
             # Mirror ForgetTrainer.compute_loss logging, but avoid per-microbatch log spam.
             if self._should_log_trainloss():
                 try:
-                    logitems = {"trainloss/loss": float(loss.detach().cpu().item())}
+                    logitems = {"trainloss/loss": loss_scalar(loss.detach())}
                     if forget_loss is not None:
-                        logitems["trainloss/forgetloss"] = float(forget_loss.detach().cpu().item())
+                        logitems["trainloss/forgetloss"] = loss_scalar(forget_loss.detach())
                     if retain_loss is not None:
-                        logitems["trainloss/retainloss"] = float(retain_loss.detach().cpu().item())
+                        logitems["trainloss/retainloss"] = loss_scalar(retain_loss.detach())
                     self.log(logitems)
                 except Exception:
                     pass
