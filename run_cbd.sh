@@ -43,6 +43,10 @@ TRAIN_GPU="${TRAIN_GPU:-0}"
 # Giữ một checkpoint mỗi epoch. Thiết kế này không còn tập valid nên Trainer không có
 # tín hiệu early-stop; để mặc định 1 thì chỉ còn đúng epoch cuối, không quay lại được.
 TRAIN_SAVE_TOTAL_LIMIT="${TRAIN_SAVE_TOTAL_LIMIT:-10}"
+# 19.334 mẫu / batch 4 / accum 2 = 2.417 bước mỗi epoch. Giá trị 10 là kế thừa từ setup
+# ToFU cũ; LoRA ở đây chỉ có 3,96M tham số nên nhiều khả năng ít epoch là đủ. Vẫn giữ
+# checkpoint từng epoch nhờ TRAIN_SAVE_TOTAL_LIMIT, chọn epoch sau bằng tập calib.
+TRAIN_EPOCHS="${TRAIN_EPOCHS:-3}"
 
 # Giai đoạn ③ — Inference
 EVAL_OUTPUT_DIR="artifacts/eval_outputs/deepseek"
@@ -128,6 +132,7 @@ run_train() {
     fi
 
     echo "  GPU:        ${TRAIN_GPU}"
+    echo "  Epochs:     ${TRAIN_EPOCHS}  (~2417 bước mỗi epoch)"
     echo "  Ckpt giữ:   ${TRAIN_SAVE_TOTAL_LIMIT} (một checkpoint mỗi epoch)"
     echo ""
 
@@ -138,6 +143,7 @@ run_train() {
         --config-name "${HYDRA_CONFIG}" \
         enable_cbd_dfb=true \
         cbd_dfb_basis_path="${BASIS_FILE}" \
+        trainer.max_epochs=${TRAIN_EPOCHS} \
         seed=${SEED}
 
     CKPT=$(find_latest_checkpoint)
