@@ -36,6 +36,13 @@ MAX_LEN=512
 
 # Giai đoạn ② — Training
 HYDRA_CONFIG="cbd_dfb_deepseek"
+# Ép một GPU: nếu thấy nhiều GPU, HF Trainer tự bọc nn.DataParallel trong khi script
+# vẫn tính lịch train theo WORLD_SIZE=1 → số bước, warmup và save_steps đều lệch.
+# Muốn dùng nhiều GPU thì phải chạy bằng torchrun (DDP), không phải DataParallel.
+TRAIN_GPU="${TRAIN_GPU:-0}"
+# Giữ một checkpoint mỗi epoch. Thiết kế này không còn tập valid nên Trainer không có
+# tín hiệu early-stop; để mặc định 1 thì chỉ còn đúng epoch cuối, không quay lại được.
+TRAIN_SAVE_TOTAL_LIMIT="${TRAIN_SAVE_TOTAL_LIMIT:-10}"
 
 # Giai đoạn ③ — Inference
 EVAL_OUTPUT_DIR="artifacts/eval_outputs/deepseek"
@@ -117,7 +124,13 @@ run_train() {
         exit 1
     fi
 
+    echo "  GPU:        ${TRAIN_GPU}"
+    echo "  Ckpt giữ:   ${TRAIN_SAVE_TOTAL_LIMIT} (một checkpoint mỗi epoch)"
+    echo ""
+
     # Không còn tập valid (train_ratio=1.0) nên phải tắt eval nội bộ của Trainer.
+    CUDA_VISIBLE_DEVICES="${TRAIN_GPU}" \
+    SAVE_TOTAL_LIMIT="${TRAIN_SAVE_TOTAL_LIMIT}" \
     DISABLE_INTERNAL_EVAL=1 python scripts/hf_forget_train.py \
         --config-name "${HYDRA_CONFIG}" \
         enable_cbd_dfb=true \
